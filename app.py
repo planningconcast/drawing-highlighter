@@ -21,12 +21,10 @@ def process():
     delivered_raw = request.form.get('delivered', '')
     files        = request.files.getlist('pdfs')
 
-    # Parse Delivered text area as 2-column data (Handles raw tabs and spaces perfectly)
     delivered_map = defaultdict(list)
     for line in delivered_raw.splitlines():
         if not line.strip():
             continue
-        # Split by tabs or multiple spaces safely
         parts = [p.strip() for p in re.split(r'\t+|\s{2,}', line.strip()) if p.strip()]
         if len(parts) >= 2:
             ref = parts[0]
@@ -44,7 +42,6 @@ def process():
     produced_set = {l.strip() for l in produced_raw.splitlines() if l.strip()}
     actual_delivered = set(delivered_map.keys())
 
-    # Progressive tier deduplication
     actual_produced  = produced_set - actual_delivered
     actual_issued    = issued_set - produced_set - actual_delivered
 
@@ -55,7 +52,6 @@ def process():
     if not files or files[0].filename == '':
         return jsonify({'error': 'No PDF files selected.'}), 400
 
-    # Dynamic regex inference from input prefixes
     detected_prefixes = set()
     for item in all_searched:
         m = re.match(r'^([A-Z]+)', item)
@@ -95,9 +91,6 @@ def process():
                 doc = fitz.open(in_path)
                 total_highlights = 0
 
-                # -----------------------------------------------------------
-                # PASS 1: GLOBAL ELEVATION SCAN & DELIVERED DUPLICATE RANKING
-                # -----------------------------------------------------------
                 delivered_instances = []
                 elev_regex = re.compile(r'\+(\d+)')
 
@@ -105,7 +98,6 @@ def process():
                     page = doc[page_idx]
                     page_blocks = page.get_text("blocks")
                     
-                    # Extract elevation values and their vertical positions on this page
                     elevations = []
                     for block in page_blocks:
                         text = block[4]
@@ -115,19 +107,17 @@ def process():
                                 'y': (block[1] + block[3]) / 2
                             })
 
-                    # Search matches for all delivered item keys
                     for ref in delivered_map.keys():
                         matches = page.search_for(ref)
                         for inst in matches:
                             match_y = (inst.y0 + inst.y1) / 2
                             match_x = (inst.x0 + inst.x1) / 2
 
-                            # Find proximity to nearest elevation marker on this page
                             if elevations:
                                 closest_elev = min(elevations, key=lambda e: abs(e['y'] - match_y))
                                 elev_val = closest_elev['value']
                             else:
-                                elev_val = 0  # Fallback value if no elevation labels found
+                                elev_val = 0
 
                             delivered_instances.append({
                                 'ref': ref,
@@ -139,7 +129,6 @@ def process():
                                 'load_no': None
                             })
 
-                # Group instances by reference ID to execute ranking logic
                 instances_by_ref = defaultdict(list)
                 for inst in delivered_instances:
                     instances_by_ref[inst['ref']].append(inst)
@@ -147,7 +136,6 @@ def process():
                 assigned_delivered_highlights = defaultdict(list)
                 
                 for ref, inst_list in instances_by_ref.items():
-                    # Sort Bottom-Up: lowest elevation first. Fallback to physical layout sequence
                     inst_list.sort(key=lambda i: (i['elevation'], i['page_idx'], i['y'], i['x']))
                     
                     loads = delivered_map[ref]
@@ -156,14 +144,10 @@ def process():
                             inst['load_no'] = loads[idx]
                         assigned_delivered_highlights[inst['page_idx']].append(inst)
 
-                # -----------------------------------------------------------
-                # PASS 2: PDF MODIFICATION & ANNOTATION
-                # -----------------------------------------------------------
                 for page_idx in range(len(doc)):
                     page = doc[page_idx]
                     page_protected_rects = []
 
-                    # PHASE 1: BLUE (DELIVERED) + LOAD LABELS
                     page_delivered = assigned_delivered_highlights.get(page_idx, [])
                     for inst_data in page_delivered:
                         inst = inst_data['rect']
@@ -176,13 +160,11 @@ def process():
                         total_highlights += 1
                         page_protected_rects.append(inst)
 
-                        # Write Load Number directly on top of the drawing layer to the right
                         if inst_data['load_no']:
                             font_size = max(7, inst.height * 0.85)
                             point = fitz.Point(inst.x1 + 4, inst.y0 + (inst.height / 2) + (font_size / 3))
                             page.insert_text(point, f"L-{inst_data['load_no']}", fontsize=font_size, color=(0.0, 0.2, 0.65), overlay=True)
 
-                    # PHASE 2: ORANGE (PRODUCED)
                     for ref in actual_produced:
                         matches = page.search_for(ref)
                         if matches:
@@ -205,7 +187,6 @@ def process():
                                 total_highlights += 1
                                 page_protected_rects.append(inst)
 
-                    # PHASE 3: YELLOW (ISSUED)
                     for ref in actual_issued:
                         matches = page.search_for(ref)
                         if matches:
@@ -227,7 +208,6 @@ def process():
                                 annot.update()
                                 total_highlights += 1
 
-                    # PHASE 4: AUDIT
                     page_text = page.get_text("text")
                     for mark in unit_pattern.findall(page_text):
                         if mark not in all_searched:
@@ -250,7 +230,6 @@ def process():
         not_found = sorted(all_searched - found_units)
         unsearched = sorted(unsearched_units_found)
 
-        # Package outputs into a zip
         if output_files:
             zip_path = os.path.join(tmpdir, 'marked_drawings.zip')
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -280,7 +259,6 @@ def process():
         result['zip_filename'] = 'marked_drawings.zip'
 
     return jsonify(result)
-
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
