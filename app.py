@@ -21,20 +21,24 @@ def process():
     delivered_raw = request.form.get('delivered', '')
     files        = request.files.getlist('pdfs')
 
-    # Parse Delivered text area as 2-column tab-separated values (Ref -> List of Loads)
+    # Parse Delivered text area as 2-column data (Handles raw tabs and spaces perfectly)
     delivered_map = defaultdict(list)
     for line in delivered_raw.splitlines():
         if not line.strip():
             continue
-        parts = line.split('\t')
-        ref = parts[0].strip()
-        load = parts[1].strip() if len(parts) > 1 else ""
+        # Split by tabs or multiple spaces safely
+        parts = [p.strip() for p in re.split(r'\t+|\s{2,}', line.strip()) if p.strip()]
+        if len(parts) >= 2:
+            ref = parts[0]
+            load = parts[1]
+        elif len(parts) == 1:
+            ref = parts[0]
+            load = ""
+        else:
+            continue
+            
         if ref:
             delivered_map[ref].append(load)
-
-    # Sort the assigned loads for predictable bottom-up pairing
-    for ref in delivered_map:
-        delivered_map[ref].sort()
 
     issued_set   = {l.strip() for l in issued_raw.splitlines()   if l.strip()}
     produced_set = {l.strip() for l in produced_raw.splitlines() if l.strip()}
@@ -143,7 +147,7 @@ def process():
                 assigned_delivered_highlights = defaultdict(list)
                 
                 for ref, inst_list in instances_by_ref.items():
-                    # Sort Bottom-Up: lowest elevation first. Fallback to physical layout sequence (page, then coordinate)
+                    # Sort Bottom-Up: lowest elevation first. Fallback to physical layout sequence
                     inst_list.sort(key=lambda i: (i['elevation'], i['page_idx'], i['y'], i['x']))
                     
                     loads = delivered_map[ref]
@@ -172,10 +176,11 @@ def process():
                         total_highlights += 1
                         page_protected_rects.append(inst)
 
-                        # Write Load Number to the immediate right of the highlight
+                        # Write Load Number directly on top of the drawing layer to the right
                         if inst_data['load_no']:
-                            point = fitz.Point(inst.x1 + 4, inst.y0 + (inst.height / 2) + 2)
-                            page.insert_text(point, inst_data['load_no'], fontsize=6, color=(0.0, 0.3, 0.7))
+                            font_size = max(7, inst.height * 0.85)
+                            point = fitz.Point(inst.x1 + 4, inst.y0 + (inst.height / 2) + (font_size / 3))
+                            page.insert_text(point, f"L-{inst_data['load_no']}", fontsize=font_size, color=(0.0, 0.2, 0.65), overlay=True)
 
                     # PHASE 2: ORANGE (PRODUCED)
                     for ref in actual_produced:
