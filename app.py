@@ -5,6 +5,7 @@ from flask import Flask, request, jsonify, send_file, render_template
 from werkzeug.utils import secure_filename
 import tempfile
 import zipfile
+from collections import defaultdict
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200MB max upload
@@ -20,21 +21,35 @@ def process():
     delivered_raw = request.form.get('delivered', '')
     files        = request.files.getlist('pdfs')
 
+    # Parse Delivered text area as 2-column tab-separated values (Ref -> List of Loads)
+    delivered_map = defaultdict(list)
+    for line in delivered_raw.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split('\t')
+        ref = parts[0].strip()
+        load = parts[1].strip() if len(parts) > 1 else ""
+        if ref:
+            delivered_map[ref].append(load)
+
+    # Sort the assigned loads for predictable bottom-up pairing
+    for ref in delivered_map:
+        delivered_map[ref].sort()
+
     issued_set   = {l.strip() for l in issued_raw.splitlines()   if l.strip()}
     produced_set = {l.strip() for l in produced_raw.splitlines() if l.strip()}
-    delivered_set = {l.strip() for l in delivered_raw.splitlines() if l.strip()}
+    actual_delivered = set(delivered_map.keys())
 
-    all_searched = issued_set | produced_set | delivered_set
+    # Progressive tier deduplication
+    actual_produced  = produced_set - actual_delivered
+    actual_issued    = issued_set - produced_set - actual_delivered
+
+    all_searched = actual_delivered | actual_produced | actual_issued
 
     if not all_searched:
         return jsonify({'error': 'All lists are empty. Paste references first.'}), 400
     if not files or files[0].filename == '':
         return jsonify({'error': 'No PDF files selected.'}), 400
-
-    # Progressive tier deduplication
-    actual_delivered = delivered_set
-    actual_produced  = produced_set - actual_delivered
-    actual_issued    = issued_set - produced_set - actual_delivered
 
     # Dynamic regex inference from input prefixes
     detected_prefixes = set()
@@ -76,20 +91,91 @@ def process():
                 doc = fitz.open(in_path)
                 total_highlights = 0
 
-                for page in doc:
+                # -----------------------------------------------------------
+                # PASS 1: GLOBAL ELEVATION SCAN & DELIVERED DUPLICATE RANKING
+                # -----------------------------------------------------------
+                delivered_instances = []
+                elev_regex = re.compile(r'\+(\d+)')
+
+                for page_idx in range(len(doc)):
+                    page = doc[page_idx]
+                    page_blocks = page.get_text("blocks")
+                    
+                    # Extract elevation values and their vertical positions on this page
+                    elevations = []
+                    for block in page_blocks:
+                        text = block[4]
+                        for m in elev_regex.findall(text):
+                            elevations.append({
+                                'value': int(m),
+                                'y': (block[1] + block[3]) / 2
+                            })
+
+                    # Search matches for all delivered item keys
+                    for ref in delivered_map.keys():
+                        matches = page.search_for(ref)
+                        for inst in matches:
+                            match_y = (inst.y0 + inst.y1) / 2
+                            match_x = (inst.x0 + inst.x1) / 2
+
+                            # Find proximity to nearest elevation marker on this page
+                            if elevations:
+                                closest_elev = min(elevations, key=lambda e: abs(e['y'] - match_y))
+                                elev_val = closest_elev['value']
+                            else:
+                                elev_val = 0  # Fallback value if no elevation labels found
+
+                            delivered_instances.append({
+                                'ref': ref,
+                                'page_idx': page_idx,
+                                'rect': inst,
+                                'elevation': elev_val,
+                                'y': match_y,
+                                'x': match_x,
+                                'load_no': None
+                            })
+
+                # Group instances by reference ID to execute ranking logic
+                instances_by_ref = defaultdict(list)
+                for inst in delivered_instances:
+                    instances_by_ref[inst['ref']].append(inst)
+
+                assigned_delivered_highlights = defaultdict(list)
+                
+                for ref, inst_list in instances_by_ref.items():
+                    # Sort Bottom-Up: lowest elevation first. Fallback to physical layout sequence (page, then coordinate)
+                    inst_list.sort(key=lambda i: (i['elevation'], i['page_idx'], i['y'], i['x']))
+                    
+                    loads = delivered_map[ref]
+                    for idx, inst in enumerate(inst_list):
+                        if idx < len(loads) and loads[idx]:
+                            inst['load_no'] = loads[idx]
+                        assigned_delivered_highlights[inst['page_idx']].append(inst)
+
+                # -----------------------------------------------------------
+                # PASS 2: PDF MODIFICATION & ANNOTATION
+                # -----------------------------------------------------------
+                for page_idx in range(len(doc)):
+                    page = doc[page_idx]
                     page_protected_rects = []
 
-                    # PHASE 1: BLUE (DELIVERED)
-                    for ref in actual_delivered:
-                        matches = page.search_for(ref)
-                        if matches:
-                            found_units.add(ref)
-                            for inst in matches:
-                                annot = page.add_highlight_annot(inst)
-                                annot.set_colors(stroke=(0.1, 0.6, 1.0))
-                                annot.update()
-                                total_highlights += 1
-                                page_protected_rects.append(inst)
+                    # PHASE 1: BLUE (DELIVERED) + LOAD LABELS
+                    page_delivered = assigned_delivered_highlights.get(page_idx, [])
+                    for inst_data in page_delivered:
+                        inst = inst_data['rect']
+                        ref = inst_data['ref']
+                        found_units.add(ref)
+
+                        annot = page.add_highlight_annot(inst)
+                        annot.set_colors(stroke=(0.1, 0.6, 1.0))
+                        annot.update()
+                        total_highlights += 1
+                        page_protected_rects.append(inst)
+
+                        # Write Load Number to the immediate right of the highlight
+                        if inst_data['load_no']:
+                            point = fitz.Point(inst.x1 + 4, inst.y0 + (inst.height / 2) + 2)
+                            page.insert_text(point, inst_data['load_no'], fontsize=6, color=(0.0, 0.3, 0.7))
 
                     # PHASE 2: ORANGE (PRODUCED)
                     for ref in actual_produced:
@@ -184,7 +270,6 @@ def process():
     }
 
     if zip_bytes:
-        # Store temporarily for download
         import base64
         result['zip_b64'] = base64.b64encode(zip_bytes).decode('utf-8')
         result['zip_filename'] = 'marked_drawings.zip'
