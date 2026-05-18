@@ -1,265 +1,377 @@
-import os
-import re
-import fitz  # PyMuPDF
-from flask import Flask, request, jsonify, send_file, render_template
-from werkzeug.utils import secure_filename
-import tempfile
-import zipfile
-from collections import defaultdict
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Drawing Highlighter</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200MB max upload
+  :root {
+    --bg:        #0e0e0e;
+    --surface:   #181818;
+    --surface2:  #222222;
+    --border:    rgba(255,255,255,0.08);
+    --border2:   rgba(255,255,255,0.14);
+    --text:      #e8e6e0;
+    --muted:     #6b6b6b;
+    --subtle:    #3a3a3a;
+    --blue:      #3b9eff;
+    --orange:    #e07a2f;
+    --yellow:    #d4aa00;
+    --green:     #3ecf72;
+    --red:       #e05252;
+    --font-sans: 'IBM Plex Sans', sans-serif;
+    --font-mono: 'IBM Plex Mono', monospace;
+  }
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+  html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--font-sans); font-size: 14px; line-height: 1.5; }
 
-@app.route('/process', methods=['POST'])
-def process():
-    issued_raw   = request.form.get('issued', '')
-    produced_raw = request.form.get('produced', '')
-    delivered_raw = request.form.get('delivered', '')
-    files        = request.files.getlist('pdfs')
+  .app { max-width: 980px; margin: 0 auto; padding: 2rem 1.5rem 4rem; display: flex; flex-direction: column; gap: 1.25rem; }
 
-    delivered_map = defaultdict(list)
-    for line in delivered_raw.splitlines():
-        if not line.strip():
-            continue
-        parts = [p.strip() for p in re.split(r'\t+|\s{2,}', line.strip()) if p.strip()]
-        if len(parts) >= 2:
-            ref = parts[0]
-            load = parts[1]
-        elif len(parts) == 1:
-            ref = parts[0]
-            load = ""
-        else:
-            continue
-            
-        if ref:
-            delivered_map[ref].append(load)
+  /* Header */
+  .header { display: flex; align-items: flex-start; justify-content: space-between; padding-bottom: 0.5rem; }
+  .header-title { font-size: 22px; font-weight: 300; color: var(--muted); letter-spacing: -0.01em; }
+  .header-sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .legend { display: flex; align-items: center; gap: 1rem; padding-top: 4px; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .dot-blue   { background: var(--blue); }
+  .dot-orange { background: var(--orange); }
+  .dot-yellow { background: var(--yellow); }
 
-    issued_set   = {l.strip() for l in issued_raw.splitlines()   if l.strip()}
-    produced_set = {l.strip() for l in produced_raw.splitlines() if l.strip()}
-    actual_delivered = set(delivered_map.keys())
+  /* Cards */
+  .card { background: var(--surface); border: 0.5px solid var(--border); border-radius: 12px; padding: 1rem 1.125rem; }
 
-    actual_produced  = produced_set - actual_delivered
-    actual_issued    = issued_set - produced_set - actual_delivered
+  /* Input columns */
+  .three-col { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; }
+  .two-col   { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px; }
+  .three-stat { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; }
 
-    all_searched = actual_delivered | actual_produced | actual_issued
+  .col-header { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; font-size: 13px; font-weight: 500; }
+  .badge { font-size: 10px; font-weight: 500; padding: 2px 7px; border-radius: 20px; letter-spacing: 0.03em; }
+  .badge-yellow { background: rgba(212,170,0,0.15); color: var(--yellow); }
+  .badge-orange { background: rgba(224,122,47,0.15); color: var(--orange); }
+  .badge-blue   { background: rgba(59,158,255,0.15); color: var(--blue); }
 
-    if not all_searched:
-        return jsonify({'error': 'All lists are empty. Paste references first.'}), 400
-    if not files or files[0].filename == '':
-        return jsonify({'error': 'No PDF files selected.'}), 400
+  textarea {
+    width: 100%; height: 128px; resize: none;
+    background: var(--surface2); border: 0.5px solid var(--border);
+    border-radius: 8px; padding: 10px 12px;
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.65;
+    color: var(--text); outline: none; transition: border-color 0.15s;
+  }
+  textarea::placeholder { color: var(--muted); }
+  textarea:focus { border-color: var(--border2); }
+  textarea[readonly] { color: var(--muted); cursor: default; }
 
-    detected_prefixes = set()
-    for item in all_searched:
-        m = re.match(r'^([A-Z]+)', item)
-        if m:
-            detected_prefixes.add(m.group(1))
+  /* File zone */
+  .section-label { font-size: 10px; font-weight: 500; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
 
-    if detected_prefixes:
-        sorted_prefixes = sorted(detected_prefixes, key=len, reverse=True)
-        prefix_str = "|".join(re.escape(p) for p in sorted_prefixes)
-        has_hyphen = any('-' in item for item in all_searched)
-        if has_hyphen:
-            unit_pattern = re.compile(r'\b(?:' + prefix_str + r')\-\d+\b')
-        else:
-            unit_pattern = re.compile(r'\b(?:' + prefix_str + r')\d+\b')
-    else:
-        unit_pattern = re.compile(r'\b[A-Z]{2,4}\-\d+\b')
+  .file-zone {
+    border: 0.5px dashed var(--subtle); border-radius: 8px;
+    padding: 14px 16px; cursor: pointer; display: flex; align-items: center;
+    justify-content: center; gap: 8px; color: var(--muted); font-size: 13px;
+    transition: border-color 0.15s, color 0.15s; user-select: none;
+  }
+  .file-zone:hover { border-color: var(--border2); color: var(--text); }
+  .file-zone.has-files { border-color: var(--border2); color: var(--text); }
+  .file-zone svg { flex-shrink: 0; }
 
-    logs = []
-    logs.append(f"Tiers loaded — {len(actual_delivered)} delivered, {len(actual_produced)} produced, {len(actual_issued)} issued")
+  /* Run button */
+  .run-btn {
+    width: 100%; padding: 13px 20px;
+    background: #1a1a1a; border: 0.5px solid var(--border2);
+    border-radius: 8px; color: var(--text); font-family: var(--font-sans);
+    font-size: 13.5px; font-weight: 500; cursor: pointer;
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    transition: background 0.15s, border-color 0.15s, transform 0.1s;
+  }
+  .run-btn:hover:not(:disabled) { background: var(--surface2); border-color: rgba(255,255,255,0.22); }
+  .run-btn:active:not(:disabled) { transform: scale(0.995); }
+  .run-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .run-btn.running { border-color: var(--blue); color: var(--blue); }
 
-    found_units = set()
-    unsearched_units_found = set()
-    output_files = []
+  /* Stat cards */
+  .stat { background: var(--surface2); border-radius: 8px; padding: 10px 14px; }
+  .stat-num { font-size: 22px; font-weight: 300; color: var(--text); font-family: var(--font-mono); }
+  .stat-label { font-size: 11px; color: var(--muted); margin-top: 2px; }
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        for upload in files:
-            filename = secure_filename(upload.filename)
-            if not filename.lower().endswith('.pdf'):
-                logs.append(f"SKIP {filename} — not a PDF")
-                continue
+  /* Audit panels */
+  .audit-header { display: flex; align-items: center; gap: 7px; font-size: 12.5px; font-weight: 500; margin-bottom: 10px; }
+  .audit-header.red  { color: var(--red); }
+  .audit-header.blue { color: var(--blue); }
 
-            in_path = os.path.join(tmpdir, filename)
-            upload.save(in_path)
+  /* Console */
+  .console {
+    background: var(--surface2); border: 0.5px solid var(--border);
+    border-radius: 8px; padding: 10px 14px; height: 120px; overflow-y: auto;
+    font-family: var(--font-mono); font-size: 11.5px; line-height: 1.7;
+    display: flex; flex-direction: column; gap: 0;
+  }
+  .console::-webkit-scrollbar { width: 4px; }
+  .console::-webkit-scrollbar-track { background: transparent; }
+  .console::-webkit-scrollbar-thumb { background: var(--subtle); border-radius: 2px; }
+  .log-ok   { color: var(--green); }
+  .log-warn { color: var(--yellow); }
+  .log-err  { color: var(--red); }
+  .log-info { color: var(--muted); }
 
-            try:
-                logs.append(f"Analyzing: {filename}")
-                doc = fitz.open(in_path)
-                total_highlights = 0
+  /* Download button */
+  .dl-btn {
+    display: none; width: 100%; padding: 11px 20px;
+    background: rgba(59,158,255,0.1); border: 0.5px solid rgba(59,158,255,0.3);
+    border-radius: 8px; color: var(--blue); font-family: var(--font-sans);
+    font-size: 13px; font-weight: 500; cursor: pointer;
+    align-items: center; justify-content: center; gap: 8px;
+    transition: background 0.15s;
+  }
+  .dl-btn:hover { background: rgba(59,158,255,0.18); }
+  .dl-btn.visible { display: flex; }
 
-                delivered_instances = []
-                elev_regex = re.compile(r'\+(\d+)')
+  /* Spinner */
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spinner { width: 14px; height: 14px; border: 1.5px solid rgba(255,255,255,0.15); border-top-color: var(--blue); border-radius: 50%; animation: spin 0.7s linear infinite; }
+</style>
+</head>
+<body>
+<div class="app">
 
-                for page_idx in range(len(doc)):
-                    page = doc[page_idx]
-                    page_blocks = page.get_text("blocks")
-                    
-                    elevations = []
-                    for block in page_blocks:
-                        text = block[4]
-                        for m in elev_regex.findall(text):
-                            elevations.append({
-                                'value': int(m),
-                                'y': (block[1] + block[3]) / 2
-                            })
+  <div class="header">
+    <div>
+      <div class="header-title">Drawing highlighter</div>
+      <div class="header-sub">Multi-priority PDF annotation &amp; audit</div>
+    </div>
+    <div class="legend">
+      <div class="legend-item"><div class="dot dot-blue"></div> Delivered</div>
+      <div class="legend-item"><div class="dot dot-orange"></div> Produced</div>
+      <div class="legend-item"><div class="dot dot-yellow"></div> Issued</div>
+    </div>
+  </div>
 
-                    for ref in delivered_map.keys():
-                        matches = page.search_for(ref)
-                        for inst in matches:
-                            match_y = (inst.y0 + inst.y1) / 2
-                            match_x = (inst.x0 + inst.x1) / 2
+  <div class="three-col">
+    <div class="card">
+      <div class="col-header">
+        <div class="dot dot-yellow"></div>
+        <span>Issued</span>
+        <span class="badge badge-yellow">Stage 1</span>
+      </div>
+      <textarea id="ta-issued" placeholder="HEC-001&#10;HEC-002&#10;HEC-003&#10;…one ref per line"></textarea>
+    </div>
+    <div class="card">
+      <div class="col-header">
+        <div class="dot dot-orange"></div>
+        <span>Produced</span>
+        <span class="badge badge-orange">Stage 2</span>
+      </div>
+      <textarea id="ta-produced" placeholder="HEC-001&#10;HEB-105199&#10;…one ref per line"></textarea>
+    </div>
+    <div class="card">
+      <div class="col-header">
+        <div class="dot dot-blue"></div>
+        <span>Delivered</span>
+        <span class="badge badge-blue">Stage 3</span>
+      </div>
+      <textarea id="ta-delivered" placeholder="HEB-105199&#09;LOAD-01&#10;P9&#09;LOAD-02&#10;…paste Ref [TAB] Load No from Excel"></textarea>
+    </div>
+  </div>
 
-                            if elevations:
-                                closest_elev = min(elevations, key=lambda e: abs(e['y'] - match_y))
-                                elev_val = closest_elev['value']
-                            else:
-                                elev_val = 0
+  <div class="card">
+    <div class="section-label">PDF drawings</div>
+    <div class="file-zone" id="file-zone">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+      </svg>
+      <span id="file-label">Click to select PDF drawings…</span>
+    </div>
+    <input type="file" id="file-input" multiple accept=".pdf" style="display:none">
+  </div>
 
-                            delivered_instances.append({
-                                'ref': ref,
-                                'page_idx': page_idx,
-                                'rect': inst,
-                                'elevation': elev_val,
-                                'y': match_y,
-                                'x': match_x,
-                                'load_no': None
-                            })
+  <button class="run-btn" id="run-btn" onclick="runProcess()">
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <polygon points="5 3 19 12 5 21 5 3"/>
+    </svg>
+    Run priority highlight &amp; drawing audit
+  </button>
 
-                instances_by_ref = defaultdict(list)
-                for inst in delivered_instances:
-                    instances_by_ref[inst['ref']].append(inst)
+  <div class="three-stat">
+    <div class="stat"><div class="stat-num" id="s-delivered">—</div><div class="stat-label">Delivered units</div></div>
+    <div class="stat"><div class="stat-num" id="s-produced">—</div><div class="stat-label">Produced only</div></div>
+    <div class="stat"><div class="stat-num" id="s-issued">—</div><div class="stat-label">Issued only</div></div>
+  </div>
 
-                assigned_delivered_highlights = defaultdict(list)
-                
-                for ref, inst_list in instances_by_ref.items():
-                    inst_list.sort(key=lambda i: (i['elevation'], i['page_idx'], i['y'], i['x']))
-                    
-                    loads = delivered_map[ref]
-                    for idx, inst in enumerate(inst_list):
-                        if idx < len(loads) and loads[idx]:
-                            inst['load_no'] = loads[idx]
-                        assigned_delivered_highlights[inst['page_idx']].append(inst)
+  <div class="two-col">
+    <div class="card">
+      <div class="audit-header red">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/>
+        </svg>
+        Not found in drawings
+      </div>
+      <textarea id="ta-notfound" readonly placeholder="Units missing from PDFs will appear here…"></textarea>
+    </div>
+    <div class="card">
+      <div class="audit-header blue">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        </svg>
+        Unsearched units spotted
+      </div>
+      <textarea id="ta-unsearched" readonly placeholder="Units found on drawings but not in your lists…"></textarea>
+    </div>
+  </div>
 
-                for page_idx in range(len(doc)):
-                    page = doc[page_idx]
-                    page_protected_rects = []
+  <button class="dl-btn" id="dl-btn">
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+    </svg>
+    Download marked drawings
+  </button>
 
-                    page_delivered = assigned_delivered_highlights.get(page_idx, [])
-                    for inst_data in page_delivered:
-                        inst = inst_data['rect']
-                        ref = inst_data['ref']
-                        found_units.add(ref)
+  <div>
+    <div class="section-label">System log</div>
+    <div class="console" id="console">
+      <div class="log-info">Ready. Paste references and select PDFs to begin.</div>
+    </div>
+  </div>
 
-                        annot = page.add_highlight_annot(inst)
-                        annot.set_colors(stroke=(0.1, 0.6, 1.0))
-                        annot.update()
-                        total_highlights += 1
-                        page_protected_rects.append(inst)
+</div>
 
-                        if inst_data['load_no']:
-                            font_size = max(7, inst.height * 0.85)
-                            point = fitz.Point(inst.x1 + 4, inst.y0 + (inst.height / 2) + (font_size / 3))
-                            page.insert_text(point, f"L-{inst_data['load_no']}", fontsize=font_size, color=(0.0, 0.2, 0.65), overlay=True)
+<script>
+const fileInput = document.getElementById('file-input');
+const fileZone  = document.getElementById('file-zone');
+const fileLabel = document.getElementById('file-label');
+let zipB64 = null;
+let zipFilename = 'marked_drawings.zip';
 
-                    for ref in actual_produced:
-                        matches = page.search_for(ref)
-                        if matches:
-                            for inst in matches:
-                                inst_area = abs(inst.width * inst.height)
-                                overlap = False
-                                if inst_area > 0:
-                                    for p_rect in page_protected_rects:
-                                        intersect = inst & p_rect
-                                        if not intersect.is_empty:
-                                            if abs(intersect.width * intersect.height) > inst_area * 0.7:
-                                                overlap = True
-                                                break
-                                if overlap:
-                                    continue
-                                found_units.add(ref)
-                                annot = page.add_highlight_annot(inst)
-                                annot.set_colors(stroke=(1.0, 0.647, 0.0))
-                                annot.update()
-                                total_highlights += 1
-                                page_protected_rects.append(inst)
+fileZone.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', () => {
+  const files = Array.from(fileInput.files);
+  if (files.length === 0) {
+    fileLabel.textContent = 'Click to select PDF drawings…';
+    fileZone.classList.remove('has-files');
+  } else if (files.length === 1) {
+    fileLabel.textContent = files[0].name;
+    fileZone.classList.add('has-files');
+  } else {
+    fileLabel.textContent = `${files.length} files selected`;
+    fileZone.classList.add('has-files');
+  }
+});
 
-                    for ref in actual_issued:
-                        matches = page.search_for(ref)
-                        if matches:
-                            for inst in matches:
-                                inst_area = abs(inst.width * inst.height)
-                                overlap = False
-                                if inst_area > 0:
-                                    for p_rect in page_protected_rects:
-                                        intersect = inst & p_rect
-                                        if not intersect.is_empty:
-                                            if abs(intersect.width * intersect.height) > inst_area * 0.7:
-                                                overlap = True
-                                                break
-                                if overlap:
-                                    continue
-                                found_units.add(ref)
-                                annot = page.add_highlight_annot(inst)
-                                annot.set_colors(stroke=(1.0, 1.0, 0.0))
-                                annot.update()
-                                total_highlights += 1
+function log(msg, type='info') {
+  const con = document.getElementById('console');
+  const d = document.createElement('div');
+  d.className = `log-${type}`;
+  d.textContent = msg;
+  con.appendChild(d);
+  con.scrollTop = con.scrollHeight;
+}
 
-                    page_text = page.get_text("text")
-                    for mark in unit_pattern.findall(page_text):
-                        if mark not in all_searched:
-                            unsearched_units_found.add(mark)
+function clearConsole() {
+  document.getElementById('console').innerHTML = '';
+}
 
-                if total_highlights > 0:
-                    out_name = f"MARKED_{filename}"
-                    out_path = os.path.join(tmpdir, out_name)
-                    doc.save(out_path, garbage=4, deflate=True, clean=True)
-                    doc.close()
-                    output_files.append((out_name, out_path))
-                    logs.append(f"OK: {out_name} ({total_highlights} highlights)")
-                else:
-                    doc.close()
-                    logs.append(f"WARN: No matches in {filename}")
+async function runProcess() {
+  const issued    = document.getElementById('ta-issued').value.trim();
+  const produced  = document.getElementById('ta-produced').value.trim();
+  const delivered = document.getElementById('ta-delivered').value.trim();
+  const files     = Array.from(fileInput.files);
 
-            except Exception as e:
-                logs.append(f"ERROR: {filename} — {e}")
+  clearConsole();
+  zipB64 = null;
+  document.getElementById('dl-btn').classList.remove('visible');
+  document.getElementById('ta-notfound').value = '';
+  document.getElementById('ta-unsearched').value = '';
 
-        not_found = sorted(all_searched - found_units)
-        unsearched = sorted(unsearched_units_found)
+  if (!issued && !produced && !delivered) {
+    log('All lists are empty. Paste references first.', 'err'); return;
+  }
+  if (files.length === 0) {
+    log('No PDF files selected.', 'warn'); return;
+  }
 
-        if output_files:
-            zip_path = os.path.join(tmpdir, 'marked_drawings.zip')
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for name, path in output_files:
-                    zf.write(path, name)
+  const btn = document.getElementById('run-btn');
+  btn.disabled = true;
+  btn.classList.add('running');
+  btn.innerHTML = '<div class="spinner"></div> Processing…';
 
-            with open(zip_path, 'rb') as f:
-                zip_bytes = f.read()
-        else:
-            zip_bytes = None
+  log(`Submitting ${files.length} file(s) for processing…`);
 
-    result = {
-        'logs': logs,
-        'not_found': not_found,
-        'unsearched': unsearched,
-        'stats': {
-            'delivered': len(actual_delivered),
-            'produced': len(actual_produced),
-            'issued': len(actual_issued),
-        },
-        'has_output': zip_bytes is not None,
+  const fd = new FormData();
+  fd.append('issued',    issued);
+  fd.append('produced',  produced);
+  fd.append('delivered', delivered);
+  files.forEach(f => fd.append('pdfs', f));
+
+  try {
+    const res  = await fetch('/process', { method: 'POST', body: fd });
+    const data = await res.json();
+
+    if (!res.ok) {
+      log(data.error || 'Server error.', 'err');
+      return;
     }
 
-    if zip_bytes:
-        import base64
-        result['zip_b64'] = base64.b64encode(zip_bytes).decode('utf-8')
-        result['zip_filename'] = 'marked_drawings.zip'
+    // Stats
+    document.getElementById('s-delivered').textContent = data.stats.delivered;
+    document.getElementById('s-produced').textContent  = data.stats.produced;
+    document.getElementById('s-issued').textContent    = data.stats.issued;
 
-    return jsonify(result)
+    // Logs
+    data.logs.forEach(line => {
+      if (line.startsWith('OK'))   log(line, 'ok');
+      else if (line.startsWith('WARN'))  log(line, 'warn');
+      else if (line.startsWith('ERROR')) log(line, 'err');
+      else log(line, 'info');
+    });
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    // Audit outputs
+    const notFoundTA = document.getElementById('ta-notfound');
+    const unsearchedTA = document.getElementById('ta-unsearched');
+
+    if (data.not_found.length > 0) {
+      notFoundTA.value = data.not_found.join('\n');
+    } else {
+      notFoundTA.value = '🎉 All listed units were found on the drawings!';
+    }
+
+    if (data.unsearched.length > 0) {
+      unsearchedTA.value = data.unsearched.join('\n');
+    } else {
+      unsearchedTA.value = '👍 No unsearched project units detected.';
+    }
+
+    // Download
+    if (data.zip_b64) {
+      zipB64 = data.zip_b64;
+      zipFilename = data.zip_filename;
+      document.getElementById('dl-btn').classList.add('visible');
+    }
+
+    log('Audit complete.', 'ok');
+
+  } catch (err) {
+    log('Network error: ' + err.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove('running');
+    btn.innerHTML = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg> Run priority highlight &amp; drawing audit`;
+  }
+}
+
+document.getElementById('dl-btn').addEventListener('click', () => {
+  if (!zipB64) return;
+  const bytes = Uint8Array.from(atob(zipB64), c => c.charCodeAt(0));
+  const blob  = new Blob([bytes], { type: 'application/zip' });
+  const url   = URL.createObjectURL(blob);
+  const a     = document.createElement('a');
+  a.href = url; a.download = zipFilename;
+  a.click();
+  URL.revokeObjectURL(url);
+});
+</script>
+</body>
+</html>
