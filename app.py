@@ -222,10 +222,10 @@ def process():
     else:
         unit_pattern = re.compile(r'\b[A-Z]{2,4}\-\d+\b')
 
-    # Stats show TOTAL units per tier (not exclusive counts)
-    total_delivered = sum(delivered_counts.values())
-    total_produced  = sum(produced_counts.values())
-    total_issued    = sum(issued_counts.values())
+    # Stats: raw counts directly from each textarea — no tier subtraction
+    total_issued    = sum(1 for l in issued_raw.splitlines()   if l.strip())
+    total_produced  = sum(1 for l in produced_raw.splitlines() if l.strip())
+    total_delivered = sum(len(v) for v in delivered_map.values())
 
     logs = [
         f"Tiers loaded — "
