@@ -1,482 +1,386 @@
-import os
-import re
-import fitz
-import math
-import base64
-import tempfile
-import zipfile
-import traceback
-from collections import defaultdict, Counter
-from flask import Flask, request, jsonify, render_template
-from werkzeug.utils import secure_filename
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Drawing Highlighter</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024
+  :root {
+    --bg:        #0e0e0e;
+    --surface:   #181818;
+    --surface2:  #222222;
+    --border:    rgba(255,255,255,0.08);
+    --border2:   rgba(255,255,255,0.14);
+    --text:      #e8e6e0;
+    --muted:     #6b6b6b;
+    --subtle:    #3a3a3a;
+    --blue:      #3b9eff;
+    --orange:    #e07a2f;
+    --yellow:    #d4aa00;
+    --green:     #3ecf72;
+    --red:       #e05252;
+    --font-sans: 'IBM Plex Sans', sans-serif;
+    --font-mono: 'IBM Plex Mono', monospace;
+  }
 
-# ===========================================================================
-# ELEVATION MARKER EXTRACTION
-# Handles: +4000  +7.600  +7 600  +11,235  -500  EL+4000
-# ===========================================================================
-ELEV_MARKER_RE = re.compile(
-    r'(?:EL\.?\s*)?([+\-])\s*(\d[\d\s]*(?:[.,]\d+)?)',
-    re.IGNORECASE
-)
+  html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--font-sans); font-size: 14px; line-height: 1.5; }
 
-def parse_elev_value(sign, digits):
-    cleaned = digits.replace(' ', '').replace(',', '.')
-    try:
-        val = float(cleaned)
-        # Heuristic: +7.600 is metres — convert to mm
-        if val < 500 and '.' in cleaned:
-            val *= 1000
-        return val if sign == '+' else -val
-    except ValueError:
-        return None
+  .app { max-width: 980px; margin: 0 auto; padding: 2rem 1.5rem 4rem; display: flex; flex-direction: column; gap: 1.25rem; }
 
-def extract_elevations(page):
-    """Return [(elev_mm, y_on_page), ...] sorted ascending."""
-    elevations = []
-    for block in page.get_text("dict")["blocks"]:
-        if block.get("type") != 0:
-            continue
-        for line in block.get("lines", []):
-            for span in line.get("spans", []):
-                for m in ELEV_MARKER_RE.finditer(span["text"]):
-                    val = parse_elev_value(m.group(1), m.group(2))
-                    if val is not None:
-                        bbox = span["bbox"]
-                        elevations.append((val, (bbox[1] + bbox[3]) / 2))
-    elevations.sort(key=lambda e: e[0])
-    return elevations
+  /* Header */
+  .header { display: flex; align-items: flex-start; justify-content: space-between; padding-bottom: 0.5rem; }
+  .header-title { font-size: 22px; font-weight: 300; color: var(--muted); letter-spacing: -0.01em; }
+  .header-sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .legend { display: flex; align-items: center; gap: 1rem; padding-top: 4px; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .dot-blue   { background: var(--blue); }
+  .dot-orange { background: var(--orange); }
+  .dot-yellow { background: var(--yellow); }
 
-def elevation_for_rect(rect, elevations):
-    """Closest elevation marker to this rect's y-centre."""
-    if not elevations:
-        return 0.0
-    ry = (rect.y0 + rect.y1) / 2
-    return min(elevations, key=lambda e: abs(e[1] - ry))[0]
+  /* Cards */
+  .card { background: var(--surface); border: 0.5px solid var(--border); border-radius: 12px; padding: 1rem 1.125rem; }
 
-# ===========================================================================
-# DRAWING TYPE DETECTION
-# Checks filename first (most reliable), then first-page text
-# ===========================================================================
-PLAN_RE = re.compile(r'\b(PLAN|PLN)\b',              re.IGNORECASE)
-ELEV_RE = re.compile(r'\b(ELEVATION|ELEV)\b',         re.IGNORECASE)
-SECT_RE = re.compile(r'\b(SECTION|SECT|SEC)\b',        re.IGNORECASE)
+  /* Input columns */
+  .three-col { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; }
+  .two-col   { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px; }
+  .three-stat { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; }
 
-def detect_drawing_type(filename, first_page_text=''):
-    # Normalise filename separators → spaces
-    name = re.sub(r'[-_]', ' ', os.path.splitext(filename)[0])
-    combined = name.upper() + '  ' + first_page_text[:2000].upper()
-    if SECT_RE.search(combined): return 'SECTION'
-    if ELEV_RE.search(combined): return 'ELEVATION'
-    if PLAN_RE.search(combined): return 'PLAN'
-    return 'UNKNOWN'
+  .col-header { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; font-size: 13px; font-weight: 500; }
+  .badge { font-size: 10px; font-weight: 500; padding: 2px 7px; border-radius: 20px; letter-spacing: 0.03em; }
+  .badge-yellow { background: rgba(212,170,0,0.15); color: var(--yellow); }
+  .badge-orange { background: rgba(224,122,47,0.15); color: var(--orange); }
+  .badge-blue   { background: rgba(59,158,255,0.15); color: var(--blue); }
 
-# ===========================================================================
-# HEAT AREA DETECTION  (plan drawings)
-# ===========================================================================
-def compute_heat_centroid(positions, page_w, page_h):
-    """
-    Divide page into 8×8 grid, find densest cluster centroid.
-    Returns None when distribution is too uniform.
-    """
-    if not positions:
-        return None
-    GRID = 8
-    cw, ch = page_w / GRID, page_h / GRID
-    grid = Counter()
-    for x, y in positions:
-        grid[(min(int(x / cw), GRID-1), min(int(y / ch), GRID-1))] += 1
+  textarea {
+    width: 100%; height: 128px; resize: none;
+    background: var(--surface2); border: 0.5px solid var(--border);
+    border-radius: 8px; padding: 10px 12px;
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.65;
+    color: var(--text); outline: none; transition: border-color 0.15s;
+  }
+  textarea::placeholder { color: var(--muted); }
+  textarea:focus { border-color: var(--border2); }
+  textarea[readonly] { color: var(--muted); cursor: default; }
 
-    max_cnt = max(grid.values())
-    avg_cnt = len(positions) / (GRID * GRID)
+  /* File zone */
+  .section-label { font-size: 10px; font-weight: 500; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
 
-    # Require peak to be at least 2× average and at least 2 units
-    if max_cnt < avg_cnt * 2.0 or max_cnt < 2:
-        return None
+  .file-zone {
+    border: 0.5px dashed var(--subtle); border-radius: 8px;
+    padding: 14px 16px; cursor: pointer; display: flex; align-items: center;
+    justify-content: center; gap: 8px; color: var(--muted); font-size: 13px;
+    transition: border-color 0.15s, color 0.15s; user-select: none;
+  }
+  .file-zone:hover { border-color: var(--border2); color: var(--text); }
+  .file-zone.has-files { border-color: var(--border2); color: var(--text); }
+  .file-zone svg { flex-shrink: 0; }
 
-    threshold = max_cnt * 0.75
-    hot = [(c, r) for (c, r), cnt in grid.items() if cnt >= threshold]
-    cx = sum((c + 0.5) * cw for c, r in hot) / len(hot)
-    cy = sum((r + 0.5) * ch for c, r in hot) / len(hot)
-    return (cx, cy)
+  /* Run button */
+  .run-btn {
+    width: 100%; padding: 13px 20px;
+    background: #1a1a1a; border: 0.5px solid var(--border2);
+    border-radius: 8px; color: var(--text); font-family: var(--font-sans);
+    font-size: 13.5px; font-weight: 500; cursor: pointer;
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    transition: background 0.15s, border-color 0.15s, transform 0.1s;
+  }
+  .run-btn:hover:not(:disabled) { background: var(--surface2); border-color: rgba(255,255,255,0.22); }
+  .run-btn:active:not(:disabled) { transform: scale(0.995); }
+  .run-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .run-btn.running { border-color: var(--blue); color: var(--blue); }
 
-def pdist(p1, p2):
-    return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
+  /* Stat cards */
+  .stat { background: var(--surface2); border-radius: 8px; padding: 10px 14px; }
+  .stat-num { font-size: 22px; font-weight: 300; color: var(--text); font-family: var(--font-mono); }
+  .stat-label { font-size: 11px; color: var(--muted); margin-top: 2px; }
 
-def sort_by_proximity(instances):
-    """Greedy nearest-neighbour — keeps spatially adjacent instances together."""
-    if len(instances) <= 1:
-        return instances[:]
-    remaining = instances[:]
-    cx = sum(i['cx'] for i in remaining) / len(remaining)
-    cy = sum(i['cy'] for i in remaining) / len(remaining)
-    start = min(remaining, key=lambda i: pdist((i['cx'], i['cy']), (cx, cy)))
-    result = [start]
-    remaining.remove(start)
-    while remaining:
-        last = result[-1]
-        nearest = min(remaining, key=lambda i: pdist((i['cx'], i['cy']), (last['cx'], last['cy'])))
-        result.append(nearest)
-        remaining.remove(nearest)
-    return result
+  /* Audit panels */
+  .audit-header { display: flex; align-items: center; gap: 7px; font-size: 12.5px; font-weight: 500; margin-bottom: 10px; }
+  .audit-header.red  { color: var(--red); }
+  .audit-header.blue { color: var(--blue); }
 
-# ===========================================================================
-# INPUT PARSERS
-# ===========================================================================
-def parse_count_list(raw):
-    """Each line = one unit. Duplicate lines = multiple units of same ref."""
-    counts = Counter()
-    for line in raw.splitlines():
-        ref = line.strip()
-        if ref:
-            counts[ref] += 1
-    return counts
+  /* Console */
+  .console {
+    background: var(--surface2); border: 0.5px solid var(--border);
+    border-radius: 8px; padding: 10px 14px; height: 120px; overflow-y: auto;
+    font-family: var(--font-mono); font-size: 11.5px; line-height: 1.7;
+    display: flex; flex-direction: column; gap: 0;
+  }
+  .console::-webkit-scrollbar { width: 4px; }
+  .console::-webkit-scrollbar-track { background: transparent; }
+  .console::-webkit-scrollbar-thumb { background: var(--subtle); border-radius: 2px; }
+  .log-ok   { color: var(--green); }
+  .log-warn { color: var(--yellow); }
+  .log-err  { color: var(--red); }
+  .log-info { color: var(--muted); }
 
-def parse_delivered(raw):
-    """
-    Tab-separated: REF <TAB> LOAD_NO
-    Returns {ref: [load_no, ...]} — length = count of that ref.
-    """
-    result = defaultdict(list)
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        parts = [p.strip() for p in re.split(r'\t+|\s{2,}', line) if p.strip()]
-        if not parts:
-            continue
-        ref  = parts[0]
-        load = parts[1] if len(parts) >= 2 else ''
-        result[ref].append(load)
-    return dict(result)
+  /* Download button */
+  .dl-btn {
+    display: none; width: 100%; padding: 11px 20px;
+    background: rgba(59,158,255,0.1); border: 0.5px solid rgba(59,158,255,0.3);
+    border-radius: 8px; color: var(--blue); font-family: var(--font-sans);
+    font-size: 13px; font-weight: 500; cursor: pointer;
+    align-items: center; justify-content: center; gap: 8px;
+    transition: background 0.15s;
+  }
+  .dl-btn:hover { background: rgba(59,158,255,0.18); }
+  .dl-btn.visible { display: flex; }
 
-# ===========================================================================
-# LOAD LABEL
-# ===========================================================================
-def insert_load_label(page, rect, load_no):
-    font_size = max(7, rect.height * 0.85)
-    pt = fitz.Point(rect.x1 + 4, rect.y0 + rect.height / 2 + font_size / 3)
-    page.insert_text(pt, load_no, fontsize=font_size,
-                     color=(0.0, 0.2, 0.65), overlay=True)
+  /* Spinner */
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spinner { width: 14px; height: 14px; border: 1.5px solid rgba(255,255,255,0.15); border-top-color: var(--blue); border-radius: 50%; animation: spin 0.7s linear infinite; }
+</style>
+</head>
+<body>
+<div class="app">
 
-# ===========================================================================
-# OVERLAP CHECK
-# ===========================================================================
-def overlaps_protected(inst, protected):
-    area = abs(inst.width * inst.height)
-    if area == 0:
-        return False
-    for p in protected:
-        inter = inst & p
-        if not inter.is_empty and abs(inter.width * inter.height) > area * 0.7:
-            return True
-    return False
+  <!-- Header -->
+  <div class="header">
+    <div>
+      <div class="header-title">Drawing highlighter</div>
+      <div class="header-sub">Multi-priority PDF annotation &amp; audit</div>
+    </div>
+    <div class="legend">
+      <div class="legend-item"><div class="dot dot-blue"></div> Delivered</div>
+      <div class="legend-item"><div class="dot dot-orange"></div> Produced</div>
+      <div class="legend-item"><div class="dot dot-yellow"></div> Issued</div>
+    </div>
+  </div>
 
-# ===========================================================================
-# FLASK ROUTES
-# ===========================================================================
-@app.route('/health')
-def health():
-    return 'ok', 200
+  <!-- Input columns -->
+  <div class="three-col">
+    <div class="card">
+      <div class="col-header">
+        <div class="dot dot-yellow"></div>
+        <span>Issued</span>
+        <span class="badge badge-yellow">Stage 1</span>
+      </div>
+      <textarea id="ta-issued" placeholder="HEC-001&#10;HEC-002&#10;HEC-003&#10;…one ref per line"></textarea>
+    </div>
+    <div class="card">
+      <div class="col-header">
+        <div class="dot dot-orange"></div>
+        <span>Produced</span>
+        <span class="badge badge-orange">Stage 2</span>
+      </div>
+      <textarea id="ta-produced" placeholder="HEC-001&#10;HEB-105199&#10;…one ref per line"></textarea>
+    </div>
+    <div class="card">
+      <div class="col-header">
+        <div class="dot dot-blue"></div>
+        <span>Delivered</span>
+        <span class="badge badge-blue">Stage 3</span>
+      </div>
+      <div style="font-size:10px;color:#6b6b6b;margin-bottom:6px;">Paste two columns from Excel: ref &rarr; TAB &rarr; load number. Duplicates OK &mdash; loads assigned bottom-up by elevation.</div>
+      <textarea id="ta-delivered" placeholder="HEB-105199&#9;LOAD-01&#10;HEB-105199&#9;LOAD-04&#10;HEC-002011&#9;LOAD-02"></textarea>
+    </div>
+  </div>
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+  <!-- File picker -->
+  <div class="card">
+    <div class="section-label">PDF drawings</div>
+    <div class="file-zone" id="file-zone">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+      </svg>
+      <span id="file-label">Click to select PDF drawings…</span>
+    </div>
+    <input type="file" id="file-input" multiple accept=".pdf" style="display:none">
+  </div>
 
-@app.route('/process', methods=['POST'])
-def process():
-    issued_raw    = request.form.get('issued', '')
-    produced_raw  = request.form.get('produced', '')
-    delivered_raw = request.form.get('delivered', '')
-    files         = request.files.getlist('pdfs')
+  <!-- Run button -->
+  <button class="run-btn" id="run-btn" onclick="runProcess()">
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <polygon points="5 3 19 12 5 21 5 3"/>
+    </svg>
+    Run priority highlight &amp; drawing audit
+  </button>
 
-    # --- Count-aware parsing ---
-    issued_counts   = parse_count_list(issued_raw)
-    produced_counts = parse_count_list(produced_raw)
-    delivered_map   = parse_delivered(delivered_raw)
-    delivered_counts = Counter({ref: len(loads) for ref, loads in delivered_map.items()})
+  <!-- Stats -->
+  <div class="three-stat">
+    <div class="stat"><div class="stat-num" id="s-delivered">—</div><div class="stat-label">Total delivered</div></div>
+    <div class="stat"><div class="stat-num" id="s-produced">—</div><div class="stat-label">Total produced</div></div>
+    <div class="stat"><div class="stat-num" id="s-issued">—</div><div class="stat-label">Total issued</div></div>
+  </div>
 
-    # Tier deduplication (higher tier wins)
-    delivered_refs = set(delivered_map.keys())
-    produced_refs  = set(produced_counts.keys()) - delivered_refs
-    issued_refs    = set(issued_counts.keys()) - set(produced_counts.keys()) - delivered_refs
-    all_searched   = delivered_refs | produced_refs | issued_refs
+  <!-- Audit columns -->
+  <div class="two-col">
+    <div class="card">
+      <div class="audit-header red">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/>
+        </svg>
+        Not found in drawings
+      </div>
+      <textarea id="ta-notfound" readonly placeholder="Units missing from PDFs will appear here…"></textarea>
+    </div>
+    <div class="card">
+      <div class="audit-header blue">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        </svg>
+        Unsearched units spotted
+      </div>
+      <textarea id="ta-unsearched" readonly placeholder="Units found on drawings but not in your lists…"></textarea>
+    </div>
+  </div>
 
-    def quota(ref):
-        if ref in delivered_refs: return delivered_counts[ref]
-        if ref in produced_refs:  return produced_counts[ref]
-        if ref in issued_refs:    return issued_counts[ref]
-        return 0
+  <!-- Download button -->
+  <button class="dl-btn" id="dl-btn">
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+    </svg>
+    Download marked drawings
+  </button>
 
-    def tier_of(ref):
-        if ref in delivered_refs: return 0  # highest priority
-        if ref in produced_refs:  return 1
-        return 2
+  <!-- Console -->
+  <div>
+    <div class="section-label">System log</div>
+    <div class="console" id="console">
+      <div class="log-info">Ready. Paste references and select PDFs to begin.</div>
+    </div>
+  </div>
 
-    if not all_searched:
-        return jsonify({'error': 'All lists are empty. Paste references first.'}), 400
-    if not files or files[0].filename == '':
-        return jsonify({'error': 'No PDF files selected.'}), 400
+</div>
 
-    # Audit regex
-    detected_prefixes = set()
-    for item in all_searched:
-        m = re.match(r'^([A-Z]+)', item)
-        if m:
-            detected_prefixes.add(m.group(1))
+<script>
+const fileInput = document.getElementById('file-input');
+const fileZone  = document.getElementById('file-zone');
+const fileLabel = document.getElementById('file-label');
+let zipB64 = null;
+let zipFilename = 'marked_drawings.zip';
 
-    if detected_prefixes:
-        sorted_pfx = sorted(detected_prefixes, key=len, reverse=True)
-        pfx_str    = '|'.join(re.escape(p) for p in sorted_pfx)
-        has_hyphen = any('-' in item for item in all_searched)
-        unit_pattern = re.compile(
-            r'\b(?:' + pfx_str + (r')\-\d+\b' if has_hyphen else r')\d+\b')
-        )
-    else:
-        unit_pattern = re.compile(r'\b[A-Z]{2,4}\-\d+\b')
+fileZone.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', () => {
+  const files = Array.from(fileInput.files);
+  if (files.length === 0) {
+    fileLabel.textContent = 'Click to select PDF drawings…';
+    fileZone.classList.remove('has-files');
+  } else if (files.length === 1) {
+    fileLabel.textContent = files[0].name;
+    fileZone.classList.add('has-files');
+  } else {
+    fileLabel.textContent = `${files.length} files selected`;
+    fileZone.classList.add('has-files');
+  }
+});
 
-    total_quotas = sum(quota(r) for r in all_searched)
-    logs = [
-        f"Tiers loaded — {len(delivered_refs)} delivered refs "
-        f"({sum(delivered_counts.values())} units), "
-        f"{len(produced_refs)} produced refs "
-        f"({sum(produced_counts[r] for r in produced_refs)} units), "
-        f"{len(issued_refs)} issued refs "
-        f"({sum(issued_counts[r] for r in issued_refs)} units) "
-        f"— {total_quotas} total units to mark"
-    ]
+function log(msg, type='info') {
+  const con = document.getElementById('console');
+  const d = document.createElement('div');
+  d.className = `log-${type}`;
+  d.textContent = msg;
+  con.appendChild(d);
+  con.scrollTop = con.scrollHeight;
+}
 
-    found_units:            set = set()
-    unsearched_units_found: set = set()
-    output_files:          list = []
-    # Global quota tracking across all files
-    marked_counts: Counter = Counter()
+function clearConsole() {
+  document.getElementById('console').innerHTML = '';
+}
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        for upload in files:
-            filename = secure_filename(upload.filename)
-            if not filename.lower().endswith('.pdf'):
-                logs.append(f"SKIP {filename} — not a PDF")
-                continue
+async function runProcess() {
+  const issued    = document.getElementById('ta-issued').value.trim();
+  const produced  = document.getElementById('ta-produced').value.trim();
+  const delivered = document.getElementById('ta-delivered').value.trim();
+  const files     = Array.from(fileInput.files);
 
-            in_path = os.path.join(tmpdir, filename)
-            upload.save(in_path)
+  clearConsole();
+  zipB64 = null;
+  document.getElementById('dl-btn').classList.remove('visible');
+  document.getElementById('ta-notfound').value = '';
+  document.getElementById('ta-unsearched').value = '';
 
-            try:
-                logs.append(f"Analyzing: {filename}")
-                doc = fitz.open(in_path)
-                total_highlights = 0
+  if (!issued && !produced && !delivered) {
+    log('All lists are empty. Paste references first.', 'err'); return;
+  }
+  if (files.length === 0) {
+    log('No PDF files selected.', 'warn'); return;
+  }
 
-                # Detect drawing type
-                first_text  = doc[0].get_text("text") if len(doc) > 0 else ''
-                draw_type   = detect_drawing_type(filename, first_text)
-                logs.append(f"  ↳ Drawing type: {draw_type}")
+  const btn = document.getElementById('run-btn');
+  btn.disabled = true;
+  btn.classList.add('running');
+  btn.innerHTML = '<div class="spinner"></div> Processing…';
 
-                # -------------------------------------------------------
-                # PRE-PASS: collect all candidate instances
-                # Only collect refs that still have remaining quota
-                # -------------------------------------------------------
-                # { ref: [instance_dict, ...] }
-                candidates = defaultdict(list)
-                all_unit_positions = []  # for heat map
+  log(`Submitting ${files.length} file(s) for processing…`);
 
-                for page_idx in range(len(doc)):
-                    page = doc[page_idx]
-                    elevations = extract_elevations(page)
+  const fd = new FormData();
+  fd.append('issued',    issued);
+  fd.append('produced',  produced);
+  fd.append('delivered', delivered);
+  files.forEach(f => fd.append('pdfs', f));
 
-                    for ref in all_searched:
-                        if quota(ref) - marked_counts[ref] <= 0:
-                            continue  # quota already met from previous files
-                        for inst in page.search_for(ref):
-                            cx = (inst.x0 + inst.x1) / 2
-                            cy = (inst.y0 + inst.y1) / 2
-                            candidates[ref].append({
-                                'ref':       ref,
-                                'page_idx':  page_idx,
-                                'rect':      inst,
-                                'elevation': elevation_for_rect(inst, elevations),
-                                'cx': cx, 'cy': cy,
-                            })
-                            all_unit_positions.append((cx, cy))
+  try {
+    const res  = await fetch('/process', { method: 'POST', body: fd });
+    const data = await res.json();
 
-                # Heat centroid for plan drawings
-                heat_centroid = None
-                if draw_type == 'PLAN' and len(doc) > 0:
-                    pw, ph = doc[0].rect.width, doc[0].rect.height
-                    heat_centroid = compute_heat_centroid(all_unit_positions, pw, ph)
-                    if heat_centroid:
-                        logs.append(f"  ↳ Heat area found at ({heat_centroid[0]:.0f}, {heat_centroid[1]:.0f})")
-                    else:
-                        logs.append(f"  ↳ No dominant heat area — using proximity grouping")
-
-                # -------------------------------------------------------
-                # SORT + QUOTA SELECTION per ref
-                # -------------------------------------------------------
-                assigned: list = []
-
-                for ref, instances in candidates.items():
-                    remaining = quota(ref) - marked_counts[ref]
-                    if remaining <= 0 or not instances:
-                        continue
-
-                    if draw_type in ('ELEVATION', 'SECTION'):
-                        all_zero = all(i['elevation'] == 0.0 for i in instances)
-                        if all_zero:
-                            # No elevation markers — fall back to bottom-of-page first
-                            instances.sort(key=lambda i: (i['page_idx'], -i['cy']))
-                            logs.append(f"  ↳ '{ref}': no elevation markers, using Y-position fallback")
-                        else:
-                            instances.sort(key=lambda i: (i['elevation'], i['page_idx'], i['cy']))
-
-                    elif draw_type == 'PLAN':
-                        if heat_centroid:
-                            instances.sort(
-                                key=lambda i: pdist((i['cx'], i['cy']), heat_centroid)
-                            )
-                        else:
-                            instances = sort_by_proximity(instances)
-
-                    else:  # UNKNOWN — try elevation, fall back to proximity
-                        all_zero = all(i['elevation'] == 0.0 for i in instances)
-                        if not all_zero:
-                            instances.sort(key=lambda i: (i['elevation'], i['page_idx'], i['cy']))
-                        else:
-                            instances = sort_by_proximity(instances)
-
-                    selected = instances[:remaining]
-
-                    # Assign load numbers to delivered instances
-                    if ref in delivered_refs:
-                        loads  = delivered_map[ref]
-                        offset = marked_counts[ref]
-                        for k, inst in enumerate(selected):
-                            load_idx = offset + k
-                            inst['load_no'] = (
-                                loads[load_idx]
-                                if load_idx < len(loads) and loads[load_idx]
-                                else None
-                            )
-                    else:
-                        for inst in selected:
-                            inst['load_no'] = None
-
-                    if len(instances) > remaining:
-                        logs.append(
-                            f"  ↳ '{ref}': {len(instances)} instances found, "
-                            f"marking {remaining} per quota "
-                            f"(drawing type: {draw_type})"
-                        )
-
-                    if len(selected) < remaining:
-                        logs.append(
-                            f"  ⚠ '{ref}': quota {quota(ref)}, "
-                            f"only {marked_counts[ref] + len(selected)} instance(s) found in total so far"
-                        )
-
-                    assigned.extend(selected)
-
-                # -------------------------------------------------------
-                # ANNOTATION PASS — priority order per page
-                # -------------------------------------------------------
-                by_page = defaultdict(list)
-                for inst in assigned:
-                    by_page[inst['page_idx']].append(inst)
-
-                for page_idx in range(len(doc)):
-                    page = doc[page_idx]
-                    # Sort so delivered annotations are placed before produced/issued
-                    # (ensures overlap protection works correctly by tier)
-                    page_instances = sorted(by_page.get(page_idx, []), key=lambda i: tier_of(i['ref']))
-                    page_protected_rects = []
-
-                    for inst_data in page_instances:
-                        inst = inst_data['rect']
-                        ref  = inst_data['ref']
-
-                        if overlaps_protected(inst, page_protected_rects):
-                            continue
-
-                        t = tier_of(ref)
-                        if t == 0:   colour = (0.1, 0.6, 1.0)   # blue
-                        elif t == 1: colour = (1.0, 0.647, 0.0)  # orange
-                        else:        colour = (1.0, 1.0, 0.0)    # yellow
-
-                        annot = page.add_highlight_annot(inst)
-                        annot.set_colors(stroke=colour)
-                        annot.update()
-                        total_highlights += 1
-                        page_protected_rects.append(inst)
-
-                        found_units.add(ref)
-                        marked_counts[ref] += 1
-
-                        if inst_data['load_no']:
-                            insert_load_label(page, inst, inst_data['load_no'])
-
-                    # Audit unsearched units
-                    for mark in unit_pattern.findall(page.get_text("text")):
-                        if mark not in all_searched:
-                            unsearched_units_found.add(mark)
-
-                if total_highlights > 0:
-                    out_name = f"MARKED_{filename}"
-                    out_path = os.path.join(tmpdir, out_name)
-                    doc.save(out_path, garbage=4, deflate=True, clean=True)
-                    doc.close()
-                    output_files.append((out_name, out_path))
-                    logs.append(f"OK: {out_name} ({total_highlights} highlights)")
-                else:
-                    doc.close()
-                    logs.append(f"WARN: No matches in {filename}")
-
-            except Exception as e:
-                logs.append(f"ERROR: {filename} — {e}")
-                logs.append(traceback.format_exc()[:500])
-
-        # Final quota summary
-        logs.append("─" * 40)
-        for ref in sorted(all_searched):
-            q = quota(ref)
-            m = marked_counts.get(ref, 0)
-            if m == 0:
-                pass  # captured in not_found
-            elif m < q:
-                logs.append(f"⚠ PARTIAL: '{ref}' — marked {m} of {q}")
-            else:
-                logs.append(f"✓ '{ref}' — {m}/{q} marked")
-
-        not_found  = sorted(all_searched - found_units)
-        unsearched = sorted(unsearched_units_found)
-
-        zip_bytes = None
-        if output_files:
-            zip_path = os.path.join(tmpdir, 'marked_drawings.zip')
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for name, path in output_files:
-                    zf.write(path, name)
-            with open(zip_path, 'rb') as f:
-                zip_bytes = f.read()
-
-    result = {
-        'logs':       logs,
-        'not_found':  not_found,
-        'unsearched': unsearched,
-        'stats': {
-            'delivered': sum(delivered_counts.values()),
-            'produced':  sum(produced_counts[r] for r in produced_refs),
-            'issued':    sum(issued_counts[r] for r in issued_refs),
-        },
-        'has_output': zip_bytes is not None,
+    if (!res.ok) {
+      log(data.error || 'Server error.', 'err');
+      return;
     }
-    if zip_bytes:
-        result['zip_b64']      = base64.b64encode(zip_bytes).decode('utf-8')
-        result['zip_filename'] = 'marked_drawings.zip'
 
-    return jsonify(result)
+    // Stats
+    document.getElementById('s-delivered').textContent = data.stats.delivered;
+    document.getElementById('s-produced').textContent  = data.stats.produced;
+    document.getElementById('s-issued').textContent    = data.stats.issued;
 
+    // Logs
+    data.logs.forEach(line => {
+      if (line.startsWith('OK'))   log(line, 'ok');
+      else if (line.startsWith('WARN'))  log(line, 'warn');
+      else if (line.startsWith('ERROR')) log(line, 'err');
+      else log(line, 'info');
+    });
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    // Audit outputs
+    const notFoundTA = document.getElementById('ta-notfound');
+    const unsearchedTA = document.getElementById('ta-unsearched');
+
+    if (data.not_found.length > 0) {
+      notFoundTA.value = data.not_found.join('\n');
+    } else {
+      notFoundTA.value = '🎉 All listed units were found on the drawings!';
+    }
+
+    if (data.unsearched.length > 0) {
+      unsearchedTA.value = data.unsearched.join('\n');
+    } else {
+      unsearchedTA.value = '👍 No unsearched project units detected.';
+    }
+
+    // Download
+    if (data.zip_b64) {
+      zipB64 = data.zip_b64;
+      zipFilename = data.zip_filename;
+      document.getElementById('dl-btn').classList.add('visible');
+    }
+
+    log('Audit complete.', 'ok');
+
+  } catch (err) {
+    log('Network error: ' + err.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove('running');
+    btn.innerHTML = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg> Run priority highlight &amp; drawing audit`;
+  }
+}
+
+document.getElementById('dl-btn').addEventListener('click', () => {
+  if (!zipB64) return;
+  const bytes = Uint8Array.from(atob(zipB64), c => c.charCodeAt(0));
+  const blob  = new Blob([bytes], { type: 'application/zip' });
+  const url   = URL.createObjectURL(blob);
+  const a     = document.createElement('a');
+  a.href = url; a.download = zipFilename;
+  a.click();
+  URL.revokeObjectURL(url);
+});
+</script>
+</body>
+</html>
