@@ -61,13 +61,62 @@ PLAN_RE = re.compile(r'\b(PLAN|PLN)\b',         re.IGNORECASE)
 ELEV_RE = re.compile(r'\b(ELEVATION|ELEV)\b',    re.IGNORECASE)
 SECT_RE = re.compile(r'\b(SECTION|SECT|SEC)\b',  re.IGNORECASE)
 
-def detect_drawing_type(filename, first_page_text=''):
-    name = re.sub(r'[-_]', ' ', os.path.splitext(filename)[0])
-    combined = name.upper() + '  ' + first_page_text[:2000].upper()
-    if SECT_RE.search(combined): return 'SECTION'
-    if ELEV_RE.search(combined): return 'ELEVATION'
-    if PLAN_RE.search(combined): return 'PLAN'
-    return 'UNKNOWN'
+def extract_title_block_text(page) -> str:
+    """
+    Extract text only from the bottom-right corner of the page —
+    where the drawing title block always lives.
+    We use the rightmost 40% of page width and bottom 25% of page height.
+    Returns concatenated text from all spans found in that zone.
+    """
+    pw = page.rect.width
+    ph = page.rect.height
+    # Define the title block zone: right 40%, bottom 25%
+    zone = fitz.Rect(pw * 0.60, ph * 0.75, pw, ph)
+    zone_text = []
+    for block in page.get_text("dict")["blocks"]:
+        if block.get("type") != 0:
+            continue
+        # Check if block bbox overlaps with the title block zone
+        bx0, by0, bx1, by1 = block["bbox"]
+        block_rect = fitz.Rect(bx0, by0, bx1, by1)
+        if not zone.intersects(block_rect):
+            continue
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                zone_text.append(span["text"])
+    return " ".join(zone_text)
+
+
+def detect_drawing_type(filename, pages) -> str:
+    """
+    Detect drawing type in this priority order:
+      1. Filename — e.g. DWG-ELEVATION-01.pdf caught immediately
+      2. Bottom-right title block zone (right 40% x bottom 25% of each page)
+      3. Full page text fallback (in case title block sits outside expected zone)
+    SECTION is checked before ELEVATION to avoid partial-word false positives.
+    """
+    # 1. Filename
+    name = re.sub(r'[-_.()\[\]]', ' ',
+                  os.path.splitext(os.path.basename(filename))[0]).upper()
+    if SECT_RE.search(name): return 'SECTION'
+    if ELEV_RE.search(name): return 'ELEVATION'
+    if PLAN_RE.search(name): return 'PLAN'
+
+    # 2. Title block zone — coordinate-based extraction
+    for page in pages:
+        tb = extract_title_block_text(page).upper()
+        if SECT_RE.search(tb): return 'SECTION'
+        if ELEV_RE.search(tb): return 'ELEVATION'
+        if PLAN_RE.search(tb): return 'PLAN'
+
+    # 3. Full page text fallback
+    for page in pages:
+        full = page.get_text("text").upper()
+        if SECT_RE.search(full): return 'SECTION'
+        if ELEV_RE.search(full): return 'ELEVATION'
+        if PLAN_RE.search(full): return 'PLAN'
+
+    return 'UNKNOWN' 
 
 # ===========================================================================
 # HEAT AREA DETECTION  (plan drawings)
@@ -265,8 +314,10 @@ def process():
         for filename, in_path in saved_paths:
             try:
                 doc = fitz.open(in_path)
-                first_text  = doc[0].get_text("text") if len(doc) > 0 else ''
-                draw_type   = detect_drawing_type(filename, first_text)
+                # Pass page objects so detect_drawing_type can do
+                # coordinate-based title block extraction
+                pages     = [doc[i] for i in range(len(doc))]
+                draw_type = detect_drawing_type(filename, pages)
                 file_draw_types[filename] = draw_type
                 logs.append(f"Scanning: {filename} [{draw_type}]")
 
@@ -332,12 +383,13 @@ def process():
             dominant_type = type_counts.most_common(1)[0][0]
 
             if dominant_type in ('ELEVATION', 'SECTION'):
-                all_zero = all(i['elevation'] == 0.0 for i in instances)
-                if all_zero:
-                    instances.sort(key=lambda i: (i['filename'], i['page_idx'], -i['cy']))
-                    logs.append(f"  ↳ '{ref}': no elevation markers — Y-position fallback")
-                else:
-                    instances.sort(key=lambda i: (i['elevation'], i['page_idx'], i['cy']))
+                # Sort strictly bottom-of-page upward.
+                # In PDF coordinate space y=0 is the TOP, y increases downward,
+                # so the largest cy value = lowest position on page = ground level.
+                # We sort by cy DESCENDING so ground-level instances are selected first.
+                # Multi-page: later pages assumed to be upper floors → page_idx ascending.
+                instances.sort(key=lambda i: (i['page_idx'], -i['cy']))
+                logs.append(f"  ↳ '{ref}': elevation/section — marking bottom-up by Y position")
 
             elif dominant_type == 'PLAN':
                 # Use per-file heat centroid
@@ -351,12 +403,10 @@ def process():
                 ) else sorted(instances, key=plan_sort_key)
 
             else:
-                # UNKNOWN — try elevation sort first
-                all_zero = all(i['elevation'] == 0.0 for i in instances)
-                if not all_zero:
-                    instances.sort(key=lambda i: (i['elevation'], i['page_idx'], i['cy']))
-                else:
-                    instances = sort_by_proximity(instances)
+                # UNKNOWN drawing type — use proximity grouping
+                # (can't reliably determine orientation without knowing the drawing type)
+                instances = sort_by_proximity(instances)
+                logs.append(f"  ↳ '{ref}': unknown drawing type — proximity grouping")
 
             selected = instances[:q]
 
