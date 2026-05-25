@@ -368,67 +368,92 @@ def process():
                 file_heat_centroids[filename] = None
 
         # ===================================================================
-        # PHASE 2: GLOBAL QUOTA SELECTION per ref
-        # Sort all instances of each ref across all files, then take first N.
+        # PHASE 2: PER-DRAWING-TYPE QUOTA SELECTION
+        #
+        # KEY RULE: quota is applied INDEPENDENTLY per drawing type.
+        # A ref appearing on both a PLAN and an ELEVATION represents the
+        # same physical unit shown from two different views — each view
+        # gets its own full quota allocation.
+        #
+        # PLAN drawings   → sort by heat centroid (busiest area first)
+        # ELEV/SECT drawings → sort bottom-up by Y position (ground first)
+        # UNKNOWN         → proximity grouping
         # ===================================================================
-        selected_instances = []  # all instances that will be annotated
+        selected_instances = []
 
         for ref, instances in all_candidates.items():
             q = quota(ref)
             if not instances:
                 continue
 
-            # Determine dominant draw type across instances of this ref
-            type_counts = Counter(i['draw_type'] for i in instances)
-            dominant_type = type_counts.most_common(1)[0][0]
+            # Split instances by drawing type
+            elev_insts = [i for i in instances if i['draw_type'] in ('ELEVATION', 'SECTION')]
+            plan_insts = [i for i in instances if i['draw_type'] == 'PLAN']
+            unkn_insts = [i for i in instances if i['draw_type'] == 'UNKNOWN']
 
-            if dominant_type in ('ELEVATION', 'SECTION'):
-                # Sort strictly bottom-of-page upward.
-                # In PDF coordinate space y=0 is the TOP, y increases downward,
-                # so the largest cy value = lowest position on page = ground level.
-                # We sort by cy DESCENDING so ground-level instances are selected first.
-                # Multi-page: later pages assumed to be upper floors → page_idx ascending.
-                instances.sort(key=lambda i: (i['page_idx'], -i['cy']))
-                logs.append(f"  ↳ '{ref}': elevation/section — marking bottom-up by Y position")
+            # --- ELEVATION / SECTION: bottom of page first (largest cy = ground) ---
+            if elev_insts:
+                elev_insts.sort(key=lambda i: (i['page_idx'], -i['cy']))
+                selected_elev = elev_insts[:q]
+                if len(elev_insts) > q:
+                    logs.append(
+                        f"  ↳ '{ref}': {len(elev_insts)} elev/sect instances, "
+                        f"marking {q} per quota [ELEVATION]"
+                    )
+                if len(selected_elev) < q:
+                    logs.append(
+                        f"  ⚠ '{ref}': elev/sect quota {q}, "
+                        f"only {len(selected_elev)} instance(s) found"
+                    )
+                selected_instances.extend(selected_elev)
 
-            elif dominant_type == 'PLAN':
-                # Use per-file heat centroid
-                def plan_sort_key(i):
-                    centroid = file_heat_centroids.get(i['filename'])
-                    if centroid:
-                        return pdist((i['cx'], i['cy']), centroid)
-                    return i['cx'] + i['cy']  # proximity fallback
-                instances = sort_by_proximity(instances) if not any(
-                    file_heat_centroids.get(i['filename']) for i in instances
-                ) else sorted(instances, key=plan_sort_key)
+            # --- PLAN: heat centroid / proximity ---
+            if plan_insts:
+                has_centroid = any(file_heat_centroids.get(i['filename']) for i in plan_insts)
+                if has_centroid:
+                    def plan_sort_key(i):
+                        centroid = file_heat_centroids.get(i['filename'])
+                        if centroid:
+                            return pdist((i['cx'], i['cy']), centroid)
+                        return i['cx'] + i['cy']
+                    plan_insts = sorted(plan_insts, key=plan_sort_key)
+                else:
+                    plan_insts = sort_by_proximity(plan_insts)
+                selected_plan = plan_insts[:q]
+                if len(plan_insts) > q:
+                    logs.append(
+                        f"  ↳ '{ref}': {len(plan_insts)} plan instances, "
+                        f"marking {q} per quota [PLAN]"
+                    )
+                if len(selected_plan) < q:
+                    logs.append(
+                        f"  ⚠ '{ref}': plan quota {q}, "
+                        f"only {len(selected_plan)} instance(s) found"
+                    )
+                selected_instances.extend(selected_plan)
 
-            else:
-                # UNKNOWN drawing type — use proximity grouping
-                # (can't reliably determine orientation without knowing the drawing type)
-                instances = sort_by_proximity(instances)
-                logs.append(f"  ↳ '{ref}': unknown drawing type — proximity grouping")
+            # --- UNKNOWN: proximity grouping ---
+            if unkn_insts:
+                unkn_insts = sort_by_proximity(unkn_insts)
+                selected_unkn = unkn_insts[:q]
+                selected_instances.extend(selected_unkn)
 
-            selected = instances[:q]
-
-            if len(instances) > q:
-                logs.append(
-                    f"  ↳ '{ref}': {len(instances)} instances across all drawings, "
-                    f"marking {q} per quota [{dominant_type}]"
-                )
-            if len(selected) < q:
-                logs.append(
-                    f"  ⚠ '{ref}': quota {q}, only {len(selected)} instance(s) found in drawings"
-                )
-
-            # Assign load numbers for delivered refs
+            # Assign load numbers for delivered refs (elevation instances first,
+            # then plan, matching bottom-up delivery sequence)
             if ref in delivered_refs:
                 loads = delivered_map[ref]
-                for k, inst in enumerate(selected):
+                all_selected_for_ref = (
+                    [i for i in selected_instances
+                     if i['ref'] == ref and i['draw_type'] in ('ELEVATION','SECTION')]
+                    + [i for i in selected_instances
+                       if i['ref'] == ref and i['draw_type'] == 'PLAN']
+                    + [i for i in selected_instances
+                       if i['ref'] == ref and i['draw_type'] == 'UNKNOWN']
+                )
+                for k, inst in enumerate(all_selected_for_ref):
                     inst['load_no'] = (
                         loads[k] if k < len(loads) and loads[k] else None
                     )
-
-            selected_instances.extend(selected)
 
         # ===================================================================
         # PHASE 3: ANNOTATE — open each file once and apply highlights
