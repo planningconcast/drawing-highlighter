@@ -15,7 +15,6 @@ app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024
 
 # ===========================================================================
 # ELEVATION MARKER EXTRACTION
-# Handles: +4000  +7.600  +7 600  +11,235  -500  EL+4000
 # ===========================================================================
 ELEV_MARKER_RE = re.compile(
     r'(?:EL\.?\s*)?([+\-])\s*(\d[\d\s]*(?:[.,]\d+)?)',
@@ -33,7 +32,6 @@ def parse_elev_value(sign, digits):
         return None
 
 def extract_elevations(page):
-    """Return [(elev_mm, y_on_page), ...] sorted ascending."""
     elevations = []
     for block in page.get_text("dict")["blocks"]:
         if block.get("type") != 0:
@@ -55,71 +53,76 @@ def elevation_for_rect(rect, elevations):
     return min(elevations, key=lambda e: abs(e[1] - ry))[0]
 
 # ===========================================================================
-# DRAWING TYPE DETECTION
+# FLOOR LEVEL EXTRACTION FROM FILENAME
+# Used to prioritise lower floors first in plan drawings.
+# ===========================================================================
+FLOOR_KEYWORDS = [
+    ('GROUND', 0), ('BASEMENT', -1), ('LOWER GROUND', -1),
+    ('FIRST', 1), ('SECOND', 2), ('THIRD', 3), ('FOURTH', 4),
+    ('FIFTH', 5), ('SIXTH', 6), ('SEVENTH', 7), ('EIGHTH', 8),
+    ('NINTH', 9), ('TENTH', 10), ('ROOF', 99),
+]
+
+def extract_floor_level(filename):
+    """Return numeric floor level. Lower number = built first."""
+    name = re.sub(r'[-_.]', ' ', filename.upper())
+    # L00, L01, L02 ... pattern (most common in your files)
+    m = re.search(r'\bL(\d{2})\b', name)
+    if m:
+        return int(m.group(1))
+    # Level/Floor number: LEVEL 1, FLOOR 2 etc.
+    m = re.search(r'\b(?:LEVEL|FLOOR)\s*(\d+)\b', name)
+    if m:
+        return int(m.group(1))
+    # Word keywords
+    for keyword, level in FLOOR_KEYWORDS:
+        if keyword in name:
+            return level
+    return 50  # unknown — goes after known floors
+
+# ===========================================================================
+# DRAWING TYPE DETECTION — coordinates-based title block
 # ===========================================================================
 PLAN_RE = re.compile(r'\b(PLAN|PLN)\b',         re.IGNORECASE)
 ELEV_RE = re.compile(r'\b(ELEVATION|ELEV)\b',    re.IGNORECASE)
 SECT_RE = re.compile(r'\b(SECTION|SECT|SEC)\b',  re.IGNORECASE)
 
-def extract_title_block_text(page) -> str:
-    """
-    Extract text only from the bottom-right corner of the page —
-    where the drawing title block always lives.
-    We use the rightmost 40% of page width and bottom 25% of page height.
-    Returns concatenated text from all spans found in that zone.
-    """
-    pw = page.rect.width
-    ph = page.rect.height
-    # Define the title block zone: right 40%, bottom 25%
+def extract_title_block_text(page):
+    """Extract text from bottom-right 40%×25% of page — the title block zone."""
+    pw, ph = page.rect.width, page.rect.height
     zone = fitz.Rect(pw * 0.60, ph * 0.75, pw, ph)
-    zone_text = []
+    parts = []
     for block in page.get_text("dict")["blocks"]:
         if block.get("type") != 0:
             continue
-        # Check if block bbox overlaps with the title block zone
-        bx0, by0, bx1, by1 = block["bbox"]
-        block_rect = fitz.Rect(bx0, by0, bx1, by1)
-        if not zone.intersects(block_rect):
+        br = fitz.Rect(block["bbox"])
+        if not zone.intersects(br):
             continue
         for line in block.get("lines", []):
             for span in line.get("spans", []):
-                zone_text.append(span["text"])
-    return " ".join(zone_text)
+                parts.append(span["text"])
+    return " ".join(parts)
 
-
-def detect_drawing_type(filename, pages) -> str:
-    """
-    Detect drawing type in this priority order:
-      1. Filename — e.g. DWG-ELEVATION-01.pdf caught immediately
-      2. Bottom-right title block zone (right 40% x bottom 25% of each page)
-      3. Full page text fallback (in case title block sits outside expected zone)
-    SECTION is checked before ELEVATION to avoid partial-word false positives.
-    """
-    # 1. Filename
-    name = re.sub(r'[-_.()\[\]]', ' ',
+def detect_drawing_type(filename, pages):
+    name = re.sub(r'[-_.()[\]]', ' ',
                   os.path.splitext(os.path.basename(filename))[0]).upper()
     if SECT_RE.search(name): return 'SECTION'
     if ELEV_RE.search(name): return 'ELEVATION'
     if PLAN_RE.search(name): return 'PLAN'
-
-    # 2. Title block zone — coordinate-based extraction
     for page in pages:
         tb = extract_title_block_text(page).upper()
         if SECT_RE.search(tb): return 'SECTION'
         if ELEV_RE.search(tb): return 'ELEVATION'
         if PLAN_RE.search(tb): return 'PLAN'
-
-    # 3. Full page text fallback
     for page in pages:
         full = page.get_text("text").upper()
         if SECT_RE.search(full): return 'SECTION'
         if ELEV_RE.search(full): return 'ELEVATION'
         if PLAN_RE.search(full): return 'PLAN'
-
-    return 'UNKNOWN' 
+    return 'UNKNOWN'
 
 # ===========================================================================
-# HEAT AREA DETECTION  (plan drawings)
+# HEAT AREA DETECTION (plan drawings)
 # ===========================================================================
 def compute_heat_centroid(positions, page_w, page_h):
     if not positions:
@@ -153,16 +156,73 @@ def sort_by_proximity(instances):
     remaining.remove(start)
     while remaining:
         last = result[-1]
-        nearest = min(remaining, key=lambda i: pdist((i['cx'], i['cy']), (last['cx'], last['cy'])))
+        nearest = min(remaining,
+                      key=lambda i: pdist((i['cx'], i['cy']), (last['cx'], last['cy'])))
         result.append(nearest)
         remaining.remove(nearest)
     return result
 
 # ===========================================================================
+# SPLIT-SHEET OVERLAP DEDUPLICATION
+# When the same floor plan is split across 2+ drawings, units near the
+# shared edge appear on both sheets.  We keep the instance that is more
+# central in its sheet and remove the near-edge duplicate.
+# ===========================================================================
+def deduplicate_sheet_overlaps(plan_insts, file_page_dims, edge_fraction=0.15):
+    """
+    For plan instances that span multiple sheets of the same floor,
+    detect and remove edge-zone duplicates.
+    edge_fraction: fraction of page width/height considered an "edge zone".
+    """
+    if len({i['filename'] for i in plan_insts}) < 2:
+        return plan_insts  # only one sheet — nothing to deduplicate
+
+    # Group by filename
+    by_file = defaultdict(list)
+    for inst in plan_insts:
+        by_file[inst['filename']].append(inst)
+
+    files = list(by_file.keys())
+    to_remove = set()
+
+    for i in range(len(files)):
+        for j in range(i + 1, len(files)):
+            fn_a, fn_b = files[i], files[j]
+            pw_a = file_page_dims.get(fn_a, (1000, 1000))[0]
+            pw_b = file_page_dims.get(fn_b, (1000, 1000))[0]
+            edge_a = pw_a * edge_fraction
+            edge_b = pw_b * edge_fraction
+
+            for ia in by_file[fn_a]:
+                if id(ia) in to_remove:
+                    continue
+                for ib in by_file[fn_b]:
+                    if id(ib) in to_remove:
+                        continue
+                    if ia['ref'] != ib['ref']:
+                        continue
+                    # Check: ia near right edge of A  AND  ib near left edge of B
+                    ia_right_edge = ia['cx'] > (pw_a - edge_a)
+                    ib_left_edge  = ib['cx'] < edge_b
+                    # OR: ia near left edge of A  AND  ib near right edge of B
+                    ia_left_edge  = ia['cx'] < edge_a
+                    ib_right_edge = ib['cx'] > (pw_b - edge_b)
+
+                    if (ia_right_edge and ib_left_edge) or (ia_left_edge and ib_right_edge):
+                        # Duplicate — remove the one closer to its edge
+                        dist_a = min(ia['cx'], pw_a - ia['cx'])
+                        dist_b = min(ib['cx'], pw_b - ib['cx'])
+                        if dist_a <= dist_b:
+                            to_remove.add(id(ia))
+                        else:
+                            to_remove.add(id(ib))
+
+    return [i for i in plan_insts if id(i) not in to_remove]
+
+# ===========================================================================
 # INPUT PARSERS
 # ===========================================================================
 def parse_count_list(raw):
-    """Each line = one unit. Duplicate lines = multiple units of same ref."""
     counts = Counter()
     for line in raw.splitlines():
         ref = line.strip()
@@ -171,7 +231,6 @@ def parse_count_list(raw):
     return counts
 
 def parse_delivered(raw):
-    """Tab-separated: REF <TAB> LOAD_NO. Returns {ref: [load_no, ...]}."""
     result = defaultdict(list)
     for line in raw.splitlines():
         line = line.strip()
@@ -186,7 +245,7 @@ def parse_delivered(raw):
     return dict(result)
 
 # ===========================================================================
-# LOAD LABEL
+# ANNOTATIONS
 # ===========================================================================
 def insert_load_label(page, rect, load_no):
     font_size = max(7, rect.height * 0.85)
@@ -194,9 +253,19 @@ def insert_load_label(page, rect, load_no):
     page.insert_text(pt, load_no, fontsize=font_size,
                      color=(0.0, 0.2, 0.65), overlay=True)
 
-# ===========================================================================
-# OVERLAP CHECK
-# ===========================================================================
+def add_highlight(page, rect, colour):
+    annot = page.add_highlight_annot(rect)
+    annot.set_colors(stroke=colour)
+    annot.update()
+
+def add_outline_rect(page, rect, colour):
+    """Rectangle outline for out-of-quota spotted instances."""
+    expanded = fitz.Rect(rect.x0 - 2, rect.y0 - 2, rect.x1 + 2, rect.y1 + 2)
+    annot = page.add_rect_annot(expanded)
+    annot.set_colors(stroke=colour, fill=None)
+    annot.set_border(width=1.5)
+    annot.update()
+
 def overlaps_protected(inst, protected):
     area = abs(inst.width * inst.height)
     if area == 0:
@@ -206,6 +275,11 @@ def overlaps_protected(inst, protected):
         if not inter.is_empty and abs(inter.width * inter.height) > area * 0.7:
             return True
     return False
+
+def tier_colour(tier):
+    if tier == 0: return (0.1, 0.6, 1.0)   # blue  — delivered
+    if tier == 1: return (1.0, 0.647, 0.0)  # orange — produced
+    return              (1.0, 1.0, 0.0)      # yellow — issued
 
 # ===========================================================================
 # FLASK ROUTES
@@ -225,21 +299,17 @@ def process():
     delivered_raw = request.form.get('delivered', '')
     files         = request.files.getlist('pdfs')
 
-    # --- Parse inputs (count-aware) ---
-    issued_counts   = parse_count_list(issued_raw)
-    produced_counts = parse_count_list(produced_raw)
-    delivered_map   = parse_delivered(delivered_raw)
+    issued_counts    = parse_count_list(issued_raw)
+    produced_counts  = parse_count_list(produced_raw)
+    delivered_map    = parse_delivered(delivered_raw)
     delivered_counts = Counter({ref: len(loads) for ref, loads in delivered_map.items()})
 
-    # Tier colouring: delivered=blue, produced-not-delivered=orange, issued-not-produced=yellow
-    # Marking priority is based on highest tier a ref appears in.
     delivered_refs = set(delivered_map.keys())
     produced_refs  = set(produced_counts.keys()) - delivered_refs
     issued_refs    = set(issued_counts.keys()) - set(produced_counts.keys()) - delivered_refs
     all_searched   = delivered_refs | produced_refs | issued_refs
 
     def quota(ref):
-        """How many instances of this ref should be marked (count from its list)."""
         if ref in delivered_refs:  return delivered_counts[ref]
         if ref in produced_refs:   return produced_counts[ref]
         if ref in issued_refs:     return issued_counts[ref]
@@ -271,35 +341,31 @@ def process():
     else:
         unit_pattern = re.compile(r'\b[A-Z]{2,4}\-\d+\b')
 
-    # Stats: raw counts directly from each textarea — no tier subtraction
-    total_issued    = sum(1 for l in issued_raw.splitlines()   if l.strip())
-    total_produced  = sum(1 for l in produced_raw.splitlines() if l.strip())
+    total_issued    = sum(1 for l in issued_raw.splitlines()    if l.strip())
+    total_produced  = sum(1 for l in produced_raw.splitlines()  if l.strip())
     total_delivered = sum(len(v) for v in delivered_map.values())
 
     logs = [
-        f"Tiers loaded — "
-        f"{len(delivered_refs)} delivered refs ({total_delivered} units), "
+        f"Tiers loaded — {len(delivered_refs)} delivered refs ({total_delivered} units), "
         f"{len(produced_refs)} produced-only refs, "
         f"{len(issued_refs)} issued-only refs — "
         f"{sum(quota(r) for r in all_searched)} total units to mark"
     ]
 
-    found_units:             set   = set()
-    unsearched_units_found:  set   = set()
-    output_files:            list  = []
+    found_units:            set  = set()
+    unsearched_units_found: set  = set()
+    output_files:           list = []
 
     with tempfile.TemporaryDirectory() as tmpdir:
 
         # ===================================================================
-        # PHASE 1: COLLECT ALL INSTANCES ACROSS ALL FILES
-        # We must scan every file before applying quota selection,
-        # so that quota is distributed globally (not consumed file-by-file).
+        # SCAN PASS — collect all instances, page dims, draw types
         # ===================================================================
-        # Structure: { ref: [ {file_path, filename, page_idx, rect, elevation, cx, cy, draw_type}, ... ] }
-        all_candidates = defaultdict(list)
-        file_draw_types = {}   # filename -> draw_type
-        file_heat_centroids = {}  # filename -> centroid or None
-        all_unit_positions_by_file = defaultdict(list)
+        all_candidates   = defaultdict(list)   # ref → [instance_dict]
+        file_draw_types  = {}
+        file_heat_centroids = {}
+        file_page_dims   = {}                  # filename → (width, height)
+        all_unit_pos_by_file = defaultdict(list)
 
         saved_paths = []
         for upload in files:
@@ -313,49 +379,44 @@ def process():
 
         for filename, in_path in saved_paths:
             try:
-                doc = fitz.open(in_path)
-                # Pass page objects so detect_drawing_type can do
-                # coordinate-based title block extraction
-                pages     = [doc[i] for i in range(len(doc))]
+                doc  = fitz.open(in_path)
+                pages = [doc[i] for i in range(len(doc))]
                 draw_type = detect_drawing_type(filename, pages)
                 file_draw_types[filename] = draw_type
-                logs.append(f"Scanning: {filename} [{draw_type}]")
+                floor_lvl = extract_floor_level(filename)
+                logs.append(f"Scanning: {filename} [{draw_type}, floor {floor_lvl}]")
 
-                for page_idx in range(len(doc)):
-                    page       = doc[page_idx]
+                for page_idx, page in enumerate(pages):
+                    file_page_dims[filename] = (page.rect.width, page.rect.height)
                     elevations = extract_elevations(page)
-
                     for ref in all_searched:
                         for inst in page.search_for(ref):
                             cx = (inst.x0 + inst.x1) / 2
                             cy = (inst.y0 + inst.y1) / 2
                             all_candidates[ref].append({
-                                'ref':       ref,
-                                'filename':  filename,
-                                'in_path':   in_path,
-                                'page_idx':  page_idx,
-                                'rect':      inst,
-                                'elevation': elevation_for_rect(inst, elevations),
+                                'ref':        ref,
+                                'filename':   filename,
+                                'in_path':    in_path,
+                                'page_idx':   page_idx,
+                                'rect':       inst,
+                                'elevation':  elevation_for_rect(inst, elevations),
                                 'cx': cx, 'cy': cy,
-                                'draw_type': draw_type,
-                                'load_no':   None,
+                                'draw_type':  draw_type,
+                                'floor_lvl':  floor_lvl,
+                                'load_no':    None,
+                                'ann_type':   'highlight',  # or 'outline'
                             })
-                            all_unit_positions_by_file[filename].append((cx, cy))
-
+                            all_unit_pos_by_file[filename].append((cx, cy))
                 doc.close()
-
             except Exception as e:
                 logs.append(f"ERROR scanning {filename}: {e}")
 
         # Compute heat centroids for plan drawings
         for filename, in_path in saved_paths:
-            draw_type = file_draw_types.get(filename, 'UNKNOWN')
-            if draw_type == 'PLAN':
+            if file_draw_types.get(filename) == 'PLAN':
                 try:
-                    doc = fitz.open(in_path)
-                    pw, ph = doc[0].rect.width, doc[0].rect.height
-                    doc.close()
-                    positions = all_unit_positions_by_file[filename]
+                    pw, ph = file_page_dims.get(filename, (1000, 1000))
+                    positions = all_unit_pos_by_file[filename]
                     centroid  = compute_heat_centroid(positions, pw, ph)
                     file_heat_centroids[filename] = centroid
                     if centroid:
@@ -364,101 +425,97 @@ def process():
                         logs.append(f"  ↳ {filename}: no heat area — proximity grouping")
                 except Exception:
                     file_heat_centroids[filename] = None
-            else:
-                file_heat_centroids[filename] = None
 
         # ===================================================================
-        # PHASE 2: PER-DRAWING-TYPE QUOTA SELECTION
+        # PHASE 2: QUOTA SELECTION
         #
-        # KEY RULE: quota is applied INDEPENDENTLY per drawing type.
-        # A ref appearing on both a PLAN and an ELEVATION represents the
-        # same physical unit shown from two different views — each view
-        # gets its own full quota allocation.
+        # PLAN / UNKNOWN:
+        #   - Deduplicate overlapping split-sheet instances
+        #   - Sort by floor level ascending (lowest = built first)
+        #   - Within same floor, sort by heat centroid distance
+        #   - First quota(ref) instances → highlight
+        #   - Remaining spotted instances → outline rectangle
         #
-        # PLAN drawings   → sort by heat centroid (busiest area first)
-        # ELEV/SECT drawings → sort bottom-up by Y position (ground first)
-        # UNKNOWN         → proximity grouping
+        # ELEVATION / SECTION:
+        #   - Global quota across ALL elevation drawings
+        #   - Sort bottom-up (largest cy first = ground level)
+        #   - First quota(ref) instances → highlight
+        #   - Remaining → outline rectangle
         # ===================================================================
-        selected_instances = []
+        selected_instances = []  # both highlights and outlines
 
         for ref, instances in all_candidates.items():
             q = quota(ref)
             if not instances:
                 continue
 
-            # Split instances by drawing type
             elev_insts = [i for i in instances if i['draw_type'] in ('ELEVATION', 'SECTION')]
-            plan_insts = [i for i in instances if i['draw_type'] == 'PLAN']
-            unkn_insts = [i for i in instances if i['draw_type'] == 'UNKNOWN']
+            plan_insts = [i for i in instances if i['draw_type'] in ('PLAN', 'UNKNOWN')]
 
-            # --- ELEVATION / SECTION: bottom of page first (largest cy = ground) ---
+            # ---- ELEVATION / SECTION ----------------------------------------
             if elev_insts:
                 elev_insts.sort(key=lambda i: (i['page_idx'], -i['cy']))
-                selected_elev = elev_insts[:q]
+                for k, inst in enumerate(elev_insts):
+                    if k < q:
+                        inst['ann_type'] = 'highlight'
+                    else:
+                        inst['ann_type'] = 'outline'
                 if len(elev_insts) > q:
                     logs.append(
                         f"  ↳ '{ref}': {len(elev_insts)} elev/sect instances, "
-                        f"marking {q} per quota [ELEVATION]"
+                        f"marking {q} bottom-up + {len(elev_insts)-q} outlined"
                     )
-                if len(selected_elev) < q:
+                elif len(elev_insts) < q:
                     logs.append(
                         f"  ⚠ '{ref}': elev/sect quota {q}, "
-                        f"only {len(selected_elev)} instance(s) found"
+                        f"only {len(elev_insts)} instance(s) found"
                     )
-                selected_instances.extend(selected_elev)
+                selected_instances.extend(elev_insts)
 
-            # --- PLAN: heat centroid / proximity ---
+            # ---- PLAN / UNKNOWN ---------------------------------------------
             if plan_insts:
-                has_centroid = any(file_heat_centroids.get(i['filename']) for i in plan_insts)
-                if has_centroid:
-                    def plan_sort_key(i):
-                        centroid = file_heat_centroids.get(i['filename'])
-                        if centroid:
-                            return pdist((i['cx'], i['cy']), centroid)
-                        return i['cx'] + i['cy']
-                    plan_insts = sorted(plan_insts, key=plan_sort_key)
-                else:
-                    plan_insts = sort_by_proximity(plan_insts)
-                selected_plan = plan_insts[:q]
+                # Deduplicate overlapping split-sheet instances
+                plan_insts = deduplicate_sheet_overlaps(plan_insts, file_page_dims)
+
+                # Sort: floor level ascending, then heat centroid distance within floor
+                def plan_key(i):
+                    centroid = file_heat_centroids.get(i['filename'])
+                    dist = pdist((i['cx'], i['cy']), centroid) if centroid else 0
+                    return (i['floor_lvl'], dist)
+
+                plan_insts.sort(key=plan_key)
+
+                for k, inst in enumerate(plan_insts):
+                    if k < q:
+                        inst['ann_type'] = 'highlight'
+                    else:
+                        inst['ann_type'] = 'outline'
+
                 if len(plan_insts) > q:
                     logs.append(
-                        f"  ↳ '{ref}': {len(plan_insts)} plan instances, "
-                        f"marking {q} per quota [PLAN]"
+                        f"  ↳ '{ref}': {len(plan_insts)} plan instances "
+                        f"(after dedup), marking {q} lowest-floor-first "
+                        f"+ {len(plan_insts)-q} outlined"
                     )
-                if len(selected_plan) < q:
+                elif len(plan_insts) < q:
                     logs.append(
                         f"  ⚠ '{ref}': plan quota {q}, "
-                        f"only {len(selected_plan)} instance(s) found"
+                        f"only {len(plan_insts)} instance(s) found after dedup"
                     )
-                selected_instances.extend(selected_plan)
+                selected_instances.extend(plan_insts)
 
-            # --- UNKNOWN: proximity grouping ---
-            if unkn_insts:
-                unkn_insts = sort_by_proximity(unkn_insts)
-                selected_unkn = unkn_insts[:q]
-                selected_instances.extend(selected_unkn)
-
-            # Assign load numbers for delivered refs (elevation instances first,
-            # then plan, matching bottom-up delivery sequence)
+            # Assign load numbers for delivered refs
             if ref in delivered_refs:
                 loads = delivered_map[ref]
-                all_selected_for_ref = (
-                    [i for i in selected_instances
-                     if i['ref'] == ref and i['draw_type'] in ('ELEVATION','SECTION')]
-                    + [i for i in selected_instances
-                       if i['ref'] == ref and i['draw_type'] == 'PLAN']
-                    + [i for i in selected_instances
-                       if i['ref'] == ref and i['draw_type'] == 'UNKNOWN']
-                )
-                for k, inst in enumerate(all_selected_for_ref):
-                    inst['load_no'] = (
-                        loads[k] if k < len(loads) and loads[k] else None
-                    )
+                # Assign to highlights only, in order: elev first then plan
+                highlights = [i for i in selected_instances
+                              if i['ref'] == ref and i['ann_type'] == 'highlight']
+                for k, inst in enumerate(highlights):
+                    inst['load_no'] = loads[k] if k < len(loads) and loads[k] else None
 
         # ===================================================================
-        # PHASE 3: ANNOTATE — open each file once and apply highlights
+        # PHASE 3: ANNOTATE — open each file and apply highlights + outlines
         # ===================================================================
-        # Group selected instances by file
         by_file = defaultdict(list)
         for inst in selected_instances:
             by_file[inst['filename']].append(inst)
@@ -471,48 +528,40 @@ def process():
 
             try:
                 doc = fitz.open(in_path)
-                total_highlights = 0
+                total_marks = 0
 
-                # Group by page
                 by_page = defaultdict(list)
                 for inst in file_instances:
                     by_page[inst['page_idx']].append(inst)
 
                 for page_idx in range(len(doc)):
                     page = doc[page_idx]
-                    # Process in priority order: delivered first, then produced, then issued
-                    page_instances = sorted(
+                    # Process highlights before outlines; within highlights, by tier
+                    page_insts = sorted(
                         by_page.get(page_idx, []),
-                        key=lambda i: tier_of(i['filename'])  # bug fix below
-                    )
-                    # ↑ sort key should be tier_of(ref), not filename
-                    page_instances = sorted(
-                        by_page.get(page_idx, []),
-                        key=lambda i: tier_of(i.get('ref', ''))
+                        key=lambda i: (0 if i['ann_type'] == 'highlight' else 1,
+                                       tier_of(i['ref']))
                     )
                     page_protected = []
 
-                    for inst_data in page_instances:
-                        ref  = inst_data.get('ref', '')
-                        inst = inst_data['rect']
+                    for inst_data in page_insts:
+                        ref   = inst_data['ref']
+                        inst  = inst_data['rect']
+                        colour = tier_colour(tier_of(ref))
 
-                        if overlaps_protected(inst, page_protected):
-                            continue
+                        if inst_data['ann_type'] == 'highlight':
+                            if overlaps_protected(inst, page_protected):
+                                continue
+                            add_highlight(page, inst, colour)
+                            page_protected.append(inst)
+                            found_units.add(ref)
+                            total_marks += 1
+                            if inst_data['load_no']:
+                                insert_load_label(page, inst, inst_data['load_no'])
 
-                        t = tier_of(ref)
-                        colour = (0.1, 0.6, 1.0) if t == 0 else \
-                                 (1.0, 0.647, 0.0) if t == 1 else \
-                                 (1.0, 1.0, 0.0)
-
-                        annot = page.add_highlight_annot(inst)
-                        annot.set_colors(stroke=colour)
-                        annot.update()
-                        total_highlights += 1
-                        page_protected.append(inst)
-                        found_units.add(ref)
-
-                        if inst_data['load_no']:
-                            insert_load_label(page, inst, inst_data['load_no'])
+                        else:  # outline — always draw, even if overlapping
+                            add_outline_rect(page, inst, colour)
+                            total_marks += 1
 
                     # Audit unsearched units
                     for mark in unit_pattern.findall(page.get_text("text")):
@@ -524,24 +573,25 @@ def process():
                 doc.save(out_path, garbage=4, deflate=True, clean=True)
                 doc.close()
                 output_files.append((out_name, out_path))
-                logs.append(f"OK: {out_name} ({total_highlights} highlights)")
+                logs.append(f"OK: {out_name} ({total_marks} annotations)")
 
             except Exception as e:
                 logs.append(f"ERROR: {filename} — {e}")
                 logs.append(traceback.format_exc()[:500])
 
-        # Final quota summary
+        # Summary
         logs.append("─" * 40)
         marked_by_ref = Counter()
         for inst in selected_instances:
-            marked_by_ref[inst.get('ref', '')] += 1
+            if inst['ann_type'] == 'highlight':
+                marked_by_ref[inst['ref']] += 1
         for ref in sorted(all_searched):
             q = quota(ref)
             m = marked_by_ref.get(ref, 0)
             if m == 0:
                 pass  # captured in not_found
             elif m < q:
-                logs.append(f"⚠ PARTIAL: '{ref}' — marked {m} of {q}")
+                logs.append(f"⚠ PARTIAL: '{ref}' — highlighted {m} of {q}")
             else:
                 logs.append(f"✓ '{ref}' — {m}/{q}")
 
@@ -562,10 +612,9 @@ def process():
         'not_found':  not_found,
         'unsearched': unsearched,
         'stats': {
-            # Show TOTAL counts per list, not exclusive
-            'delivered': total_delivered,
-            'produced':  total_produced,
             'issued':    total_issued,
+            'produced':  total_produced,
+            'delivered': total_delivered,
         },
         'has_output': zip_bytes is not None,
     }
