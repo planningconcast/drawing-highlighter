@@ -163,59 +163,217 @@ def sort_by_proximity(instances):
     return result
 
 # ===========================================================================
-# SPLIT-SHEET OVERLAP DEDUPLICATION
-# When the same floor plan is split across 2+ drawings, units near the
-# shared edge appear on both sheets.  We keep the instance that is more
-# central in its sheet and remove the near-edge duplicate.
+# SPLIT-SHEET DETECTION & OVERLAP DEDUPLICATION
+#
+# When one floor plan is split across 2 (or more) drawings, units near the
+# shared gridline appear on both sheets and must only be marked once.
+#
+# Detection strategy (in order of reliability):
+#   1. Filename contains "1 OF 2" / "2 OF 2" / "SHEET_1_OF_2" etc.
+#   2. Title block text contains the same pattern
+#   3. Shared gridline: grid refs (letters/numbers) found on both the right
+#      margin of sheet A and the left margin of sheet B confirm the join edge.
+#
+# Once the shared gridline x-position is known for each sheet, any instance
+# that falls on the "wrong" side (overlap zone) of that line is a duplicate
+# and is removed — keeping only the more-central instance.
 # ===========================================================================
-def deduplicate_sheet_overlaps(plan_insts, file_page_dims, edge_fraction=0.15):
-    """
-    For plan instances that span multiple sheets of the same floor,
-    detect and remove edge-zone duplicates.
-    edge_fraction: fraction of page width/height considered an "edge zone".
-    """
-    if len({i['filename'] for i in plan_insts}) < 2:
-        return plan_insts  # only one sheet — nothing to deduplicate
 
-    # Group by filename
+SHEET_OF_RE = re.compile(
+    r'(\d+)\s*(?:OF|_OF_)\s*(\d+)', re.IGNORECASE
+)
+# Grid refs: single/double uppercase letters or 1-3 digit numbers
+GRID_REF_RE = re.compile(r'^[A-Z]{1,2}$|^\d{1,3}$')
+
+def get_sheet_number(filename):
+    """Return (sheet_num, total_sheets) from filename, or None."""
+    name = re.sub(r'[-.]', '_', os.path.basename(filename).upper())
+    m = SHEET_OF_RE.search(name)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None
+
+def extract_margin_grid_refs(page, side, margin=0.08):
+    """
+    Extract grid reference labels from one vertical margin of the page.
+    side: 'left' or 'right'
+    Returns dict {ref_text: x_centre_on_page}
+    """
+    pw, ph = page.rect.width, page.rect.height
+    # Exclude top/bottom 5% to avoid title block and sheet border text
+    if side == 'right':
+        zone = fitz.Rect(pw * (1.0 - margin), ph * 0.05, pw, ph * 0.95)
+    else:
+        zone = fitz.Rect(0, ph * 0.05, pw * margin, ph * 0.95)
+
+    refs = {}
+    for block in page.get_text("dict")["blocks"]:
+        if block.get("type") != 0:
+            continue
+        br = fitz.Rect(block["bbox"])
+        if not zone.intersects(br):
+            continue
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                text = span["text"].strip()
+                if GRID_REF_RE.match(text):
+                    cx = (span["bbox"][0] + span["bbox"][2]) / 2
+                    refs[text] = cx
+    return refs
+
+
+def find_shared_gridline(page_a, page_b):
+    """
+    Find the x-position of the shared gridline between two adjacent sheets.
+    sheet A's right margin grid refs are compared with sheet B's left margin.
+    Returns (x_in_a, x_in_b) or None if no shared refs found.
+    """
+    right_of_a = extract_margin_grid_refs(page_a, 'right')
+    left_of_b  = extract_margin_grid_refs(page_b, 'left')
+    shared = set(right_of_a.keys()) & set(left_of_b.keys())
+    if shared:
+        # Use the rightmost shared ref in A and leftmost in B
+        x_a = max(right_of_a[r] for r in shared)
+        x_b = min(left_of_b[r]  for r in shared)
+        return x_a, x_b
+    return None
+
+
+def build_sheet_pairs(saved_paths, file_draw_types, file_docs):
+    """
+    Identify pairs of split-sheet plan drawings for the same floor.
+    Returns list of dicts:
+      { 'fn_a': filename, 'fn_b': filename,
+        'boundary_x_a': float, 'boundary_x_b': float }
+    boundary_x_a = x in sheet A beyond which is the overlap zone (right side)
+    boundary_x_b = x in sheet B below which is the overlap zone (left side)
+    """
+    pairs = []
+    plan_files = [(fn, ip) for fn, ip in saved_paths
+                  if file_draw_types.get(fn) in ('PLAN', 'UNKNOWN')]
+
+    # Group by floor level
+    by_floor = defaultdict(list)
+    for fn, ip in plan_files:
+        lvl = extract_floor_level(fn)
+        by_floor[lvl].append((fn, ip))
+
+    for lvl, floor_files in by_floor.items():
+        if len(floor_files) < 2:
+            continue
+
+        # Find files that declare themselves as part of a multi-sheet set
+        sheet_numbered = []
+        for fn, ip in floor_files:
+            sn = get_sheet_number(fn)
+            if sn:
+                sheet_numbered.append((fn, ip, sn[0], sn[1]))
+
+        if len(sheet_numbered) >= 2:
+            # Sort by sheet number and pair consecutive sheets
+            sheet_numbered.sort(key=lambda x: x[2])
+            for k in range(len(sheet_numbered) - 1):
+                fn_a, ip_a, sn_a, _ = sheet_numbered[k]
+                fn_b, ip_b, sn_b, _ = sheet_numbered[k + 1]
+
+                doc_a = file_docs.get(fn_a)
+                doc_b = file_docs.get(fn_b)
+                if not doc_a or not doc_b:
+                    continue
+
+                page_a = doc_a[0]
+                page_b = doc_b[0]
+                result = find_shared_gridline(page_a, page_b)
+
+                if result:
+                    bx_a, bx_b = result
+                    pairs.append({
+                        'fn_a': fn_a, 'fn_b': fn_b,
+                        'boundary_x_a': bx_a,
+                        'boundary_x_b': bx_b,
+                        'method': 'gridline'
+                    })
+                else:
+                    # Fallback: use page-width fraction as boundary
+                    pw_a = doc_a[0].rect.width
+                    pw_b = doc_b[0].rect.width
+                    pairs.append({
+                        'fn_a': fn_a, 'fn_b': fn_b,
+                        'boundary_x_a': pw_a * 0.85,
+                        'boundary_x_b': pw_b * 0.15,
+                        'method': 'fallback'
+                    })
+        else:
+            # No sheet numbers — try all pairs using gridline detection only
+            for i in range(len(floor_files)):
+                for j in range(i + 1, len(floor_files)):
+                    fn_a, ip_a = floor_files[i]
+                    fn_b, ip_b = floor_files[j]
+                    doc_a = file_docs.get(fn_a)
+                    doc_b = file_docs.get(fn_b)
+                    if not doc_a or not doc_b:
+                        continue
+                    result = find_shared_gridline(doc_a[0], doc_b[0])
+                    if result:
+                        bx_a, bx_b = result
+                        pairs.append({
+                            'fn_a': fn_a, 'fn_b': fn_b,
+                            'boundary_x_a': bx_a,
+                            'boundary_x_b': bx_b,
+                            'method': 'gridline'
+                        })
+    return pairs
+
+
+def deduplicate_sheet_overlaps(plan_insts, sheet_pairs, logs):
+    """
+    Remove duplicate instances in the overlap zone between paired sheets.
+    For each pair, instances past the boundary in sheet A or before the
+    boundary in sheet B are in the overlap zone.  When the same ref appears
+    in the overlap zone of both sheets, keep the instance that is further
+    from the shared edge (i.e. more central to its own sheet).
+    """
+    if not sheet_pairs or len({i['filename'] for i in plan_insts}) < 2:
+        return plan_insts
+
+    to_remove = set()
     by_file = defaultdict(list)
     for inst in plan_insts:
         by_file[inst['filename']].append(inst)
 
-    files = list(by_file.keys())
-    to_remove = set()
+    for pair in sheet_pairs:
+        fn_a = pair['fn_a']
+        fn_b = pair['fn_b']
+        bx_a = pair['boundary_x_a']   # right-side boundary in sheet A
+        bx_b = pair['boundary_x_b']   # left-side boundary in sheet B
+        method = pair.get('method', 'fallback')
 
-    for i in range(len(files)):
-        for j in range(i + 1, len(files)):
-            fn_a, fn_b = files[i], files[j]
-            pw_a = file_page_dims.get(fn_a, (1000, 1000))[0]
-            pw_b = file_page_dims.get(fn_b, (1000, 1000))[0]
-            edge_a = pw_a * edge_fraction
-            edge_b = pw_b * edge_fraction
+        insts_a = by_file.get(fn_a, [])
+        insts_b = by_file.get(fn_b, [])
 
-            for ia in by_file[fn_a]:
-                if id(ia) in to_remove:
+        overlap_a = [i for i in insts_a if i['cx'] >= bx_a and id(i) not in to_remove]
+        overlap_b = [i for i in insts_b if i['cx'] <= bx_b and id(i) not in to_remove]
+
+        removed = 0
+        for ia in overlap_a:
+            for ib in overlap_b:
+                if ia['ref'] != ib['ref']:
                     continue
-                for ib in by_file[fn_b]:
-                    if id(ib) in to_remove:
-                        continue
-                    if ia['ref'] != ib['ref']:
-                        continue
-                    # Check: ia near right edge of A  AND  ib near left edge of B
-                    ia_right_edge = ia['cx'] > (pw_a - edge_a)
-                    ib_left_edge  = ib['cx'] < edge_b
-                    # OR: ia near left edge of A  AND  ib near right edge of B
-                    ia_left_edge  = ia['cx'] < edge_a
-                    ib_right_edge = ib['cx'] > (pw_b - edge_b)
+                # Same ref in overlap zone of both sheets — keep the more central one
+                dist_a = abs(ia['cx'] - bx_a)  # distance from boundary in A
+                dist_b = abs(ib['cx'] - bx_b)  # distance from boundary in B
+                if dist_a <= dist_b:
+                    to_remove.add(id(ia))
+                else:
+                    to_remove.add(id(ib))
+                removed += 1
 
-                    if (ia_right_edge and ib_left_edge) or (ia_left_edge and ib_right_edge):
-                        # Duplicate — remove the one closer to its edge
-                        dist_a = min(ia['cx'], pw_a - ia['cx'])
-                        dist_b = min(ib['cx'], pw_b - ib['cx'])
-                        if dist_a <= dist_b:
-                            to_remove.add(id(ia))
-                        else:
-                            to_remove.add(id(ib))
+        if removed > 0:
+            logs.append(
+                f"  ↳ Split-sheet dedup [{method}]: "
+                f"{os.path.basename(fn_a)} / {os.path.basename(fn_b)} "
+                f"— removed {removed} overlap duplicate(s)"
+            )
 
     return [i for i in plan_insts if id(i) not in to_remove]
 
@@ -412,6 +570,8 @@ def process():
             upload.save(in_path)
             saved_paths.append((filename, in_path))
 
+        file_docs = {}  # keep docs open for sheet-pair gridline detection
+
         for filename, in_path in saved_paths:
             try:
                 doc  = fitz.open(in_path)
@@ -442,7 +602,7 @@ def process():
                                 'ann_type':   'highlight',  # or 'outline'
                             })
                             all_unit_pos_by_file[filename].append((cx, cy))
-                doc.close()
+                file_docs[filename] = doc  # keep open for pair detection
             except Exception as e:
                 logs.append(f"ERROR scanning {filename}: {e}")
 
@@ -460,6 +620,24 @@ def process():
                         logs.append(f"  ↳ {filename}: no heat area — proximity grouping")
                 except Exception:
                     file_heat_centroids[filename] = None
+
+        # Build split-sheet pairs for overlap deduplication
+        sheet_pairs = build_sheet_pairs(saved_paths, file_draw_types, file_docs)
+        if sheet_pairs:
+            for p in sheet_pairs:
+                logs.append(
+                    f"  ↳ Split-sheet pair detected [{p['method']}]: "
+                    f"{os.path.basename(p['fn_a'])} ↔ {os.path.basename(p['fn_b'])} "
+                    f"(boundary x={p['boundary_x_a']:.0f} / {p['boundary_x_b']:.0f})"
+                )
+
+        # Close docs after pair detection — no longer needed until annotation pass
+        for doc in file_docs.values():
+            try:
+                doc.close()
+            except Exception:
+                pass
+        file_docs = {}
 
         # ===================================================================
         # PHASE 2: QUOTA SELECTION
@@ -509,8 +687,8 @@ def process():
 
             # ---- PLAN / UNKNOWN ---------------------------------------------
             if plan_insts:
-                # Deduplicate overlapping split-sheet instances
-                plan_insts = deduplicate_sheet_overlaps(plan_insts, file_page_dims)
+                # Deduplicate overlapping split-sheet instances using detected pairs
+                plan_insts = deduplicate_sheet_overlaps(plan_insts, sheet_pairs, logs)
 
                 # Sort: floor level ascending, then heat centroid distance within floor
                 def plan_key(i):
