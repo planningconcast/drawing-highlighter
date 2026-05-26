@@ -259,7 +259,8 @@ def insert_load_label(page, rect, load_no):
     if re.match(r'^[0-9]', label):
         label = 'Load ' + label
 
-    font_size = max(7, rect.height * 0.85)
+    # Use min(width, height) so rotated text (tall narrow rect) does not produce oversized labels
+    font_size = max(7, min(rect.width, rect.height) * 0.85)
     # Estimate text width: ~0.55 * font_size per character (Helvetica)
     text_w = len(label) * font_size * 0.55
     text_h = font_size * 1.2
