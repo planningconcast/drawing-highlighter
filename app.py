@@ -248,10 +248,40 @@ def parse_delivered(raw):
 # ANNOTATIONS
 # ===========================================================================
 def insert_load_label(page, rect, load_no):
+    """
+    Insert a load label to the right of the highlight.
+    Prepends 'Load ' if the value is purely a number/code (e.g. 1, 10, 1A, 30b).
+    Draws a blue-bordered rectangle behind the text for visibility.
+    """
+    # Prepend 'Load ' unless the user already included a word prefix
+    # (e.g. 'LOAD-01' stays as-is; '1A' becomes 'Load 1A')
+    label = load_no.strip()
+    if re.match(r'^[0-9]', label):
+        label = 'Load ' + label
+
     font_size = max(7, rect.height * 0.85)
-    pt = fitz.Point(rect.x1 + 4, rect.y0 + rect.height / 2 + font_size / 3)
-    page.insert_text(pt, load_no, fontsize=font_size,
-                     color=(0.0, 0.2, 0.65), overlay=True)
+    # Estimate text width: ~0.55 * font_size per character (Helvetica)
+    text_w = len(label) * font_size * 0.55
+    text_h = font_size * 1.2
+    pad = 2
+
+    x0 = rect.x1 + 3
+    y0 = rect.y0 + (rect.height - text_h) / 2
+    x1 = x0 + text_w + pad * 2
+    y1 = y0 + text_h
+
+    label_rect = fitz.Rect(x0, y0, x1, y1)
+
+    # Blue filled background rectangle
+    bg = page.add_rect_annot(label_rect)
+    bg.set_colors(stroke=(0.1, 0.4, 0.85), fill=(0.85, 0.93, 1.0))
+    bg.set_border(width=1.0)
+    bg.update()
+
+    # Text on top
+    pt = fitz.Point(x0 + pad, y1 - pad - 1)
+    page.insert_text(pt, label, fontsize=font_size,
+                     color=(0.0, 0.15, 0.55), overlay=True)
 
 def add_highlight(page, rect, colour):
     annot = page.add_highlight_annot(rect)
