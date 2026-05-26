@@ -272,13 +272,17 @@ def insert_load_label(page, rect, load_no):
 
     label_rect = fitz.Rect(x0, y0, x1, y1)
 
-    # Blue filled background rectangle
-    bg = page.add_rect_annot(label_rect)
-    bg.set_colors(stroke=(0.1, 0.4, 0.85), fill=(0.85, 0.93, 1.0))
-    bg.set_border(width=1.0)
-    bg.update()
+    # Draw rectangle directly into the page content stream so it sits
+    # BEHIND the text (annotations always render on top of insert_text).
+    page.draw_rect(
+        label_rect,
+        color=(0.1, 0.4, 0.85),   # border colour
+        fill=(0.85, 0.93, 1.0),   # light blue fill
+        width=1.0,
+        overlay=True
+    )
 
-    # Text on top
+    # Text drawn after — sits on top of the rectangle
     pt = fitz.Point(x0 + pad, y1 - pad - 1)
     page.insert_text(pt, label, fontsize=font_size,
                      color=(0.0, 0.15, 0.55), overlay=True)
