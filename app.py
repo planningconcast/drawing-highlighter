@@ -163,27 +163,21 @@ def sort_by_proximity(instances):
     return result
 
 # ===========================================================================
-# SPLIT-SHEET DETECTION & OVERLAP DEDUPLICATION
+# SPLIT-SHEET DETECTION & BOUNDARY STRIP APPROACH
 #
-# When one floor plan is split across 2 (or more) drawings, units near the
-# shared gridline appear on both sheets and must only be marked once.
+# When one floor plan is split across 2+ sheets (e.g. gridlines 1-8 and 8-14),
+# the shared gridline appears on both sheets. Any unit whose callout label sits
+# within a narrow strip around that gridline on sheet 2 is a boundary duplicate
+# — sheet 1 owns the boundary, sheet 2 gets outline-only for those units.
 #
-# Detection strategy (in order of reliability):
-#   1. Filename contains "1 OF 2" / "2 OF 2" / "SHEET_1_OF_2" etc.
-#   2. Title block text contains the same pattern
-#   3. Shared gridline: grid refs (letters/numbers) found on both the right
-#      margin of sheet A and the left margin of sheet B confirm the join edge.
-#
-# Once the shared gridline x-position is known for each sheet, any instance
-# that falls on the "wrong" side (overlap zone) of that line is a duplicate
-# and is removed — keeping only the more-central instance.
+# Detection pipeline:
+#   1. Filename "SHEET_1_OF_2" / "SHEET_2_OF_2" → confirmed pair
+#   2. "FOR CONTINUATION SEE DRAWING" text → approximate boundary x
+#   3. Vector drawing scan → long vertical line near approx_x → exact gridline x
+#   4. Strip on sheet 2 centred on that x → refs inside get outline-only
 # ===========================================================================
 
-SHEET_OF_RE = re.compile(
-    r'(\d+)\s*(?:OF|_OF_)\s*(\d+)', re.IGNORECASE
-)
-# Grid refs: single/double uppercase letters or 1-3 digit numbers
-GRID_REF_RE = re.compile(r'^[A-Z]{1,2}$|^\d{1,3}$')
+SHEET_OF_RE = re.compile(r'(\d+)\s*(?:OF|_OF_)\s*(\d+)', re.IGNORECASE)
 
 def get_sheet_number(filename):
     """Return (sheet_num, total_sheets) from filename, or None."""
@@ -193,108 +187,77 @@ def get_sheet_number(filename):
         return int(m.group(1)), int(m.group(2))
     return None
 
-def extract_margin_grid_refs(page, side, margin=0.08):
+
+def find_continuation_x(page, side):
     """
-    Extract grid reference labels from one vertical margin of the page.
-    side: 'left' or 'right'
-    Returns dict {ref_text: x_centre_on_page}
+    Find approximate x of the shared edge from 'FOR CONTINUATION SEE DRAWING' text.
+    side: 'right' (sheet A) or 'left' (sheet B).
+    Returns x float or None.
     """
     pw, ph = page.rect.width, page.rect.height
-    # Exclude top/bottom 5% to avoid title block and sheet border text
-    if side == 'right':
-        zone = fitz.Rect(pw * (1.0 - margin), ph * 0.05, pw, ph * 0.95)
-    else:
-        zone = fitz.Rect(0, ph * 0.05, pw * margin, ph * 0.95)
-
-    refs = {}
-    for block in page.get_text("dict")["blocks"]:
-        if block.get("type") != 0:
-            continue
-        br = fitz.Rect(block["bbox"])
-        if not zone.intersects(br):
-            continue
-        for line in block.get("lines", []):
-            for span in line.get("spans", []):
-                text = span["text"].strip()
-                if GRID_REF_RE.match(text):
-                    cx = (span["bbox"][0] + span["bbox"][2]) / 2
-                    refs[text] = cx
-    return refs
-
-
-def find_continuation_boundary(page, side):
-    """
-    Look for 'FOR CONTINUATION SEE DRAWING' text on the given side of the page.
-    These notes appear right at the shared edge on split-sheet drawings.
-    Returns the x-centre of the text block, or None.
-    side: 'right' or 'left'
-    """
-    pw = page.rect.width
-    ph = page.rect.height
-    # Search entire width but only relevant horizontal half
-    if side == 'right':
-        zone = fitz.Rect(pw * 0.5, 0, pw, ph)
-    else:
-        zone = fitz.Rect(0, 0, pw * 0.5, ph)
+    search_zone = fitz.Rect(pw * 0.5, 0, pw, ph) if side == 'right'              else fitz.Rect(0, 0, pw * 0.5, ph)
 
     for block in page.get_text("dict")["blocks"]:
         if block.get("type") != 0:
             continue
         br = fitz.Rect(block["bbox"])
-        if not zone.intersects(br):
+        if not search_zone.intersects(br):
             continue
-        # Concatenate all span text in block
-        block_text = " ".join(
+        text = " ".join(
             span["text"]
             for line in block.get("lines", [])
             for span in line.get("spans", [])
         ).upper()
-        if "FOR CONTINUATION" in block_text or "SEE DRAWING" in block_text:
-            # Return x position of this block (left edge = the boundary line)
-            if side == 'right':
-                return block["bbox"][0]   # left edge of the continuation note
-            else:
-                return block["bbox"][2]   # right edge of the continuation note
+        if "FOR CONTINUATION" in text or "SEE DRAWING" in text:
+            return block["bbox"][0] if side == "right" else block["bbox"][2]
     return None
 
 
-def find_shared_gridline(page_a, page_b):
+def refine_gridline_x(page, approx_x, search_margin=400):
     """
-    Find the x-position of the shared edge between two adjacent sheets.
-
-    Detection methods in priority order:
-    1. 'FOR CONTINUATION SEE DRAWING' text block — appears right at the
-       shared edge on structural drawings, most reliable.
-    2. Shared grid circle labels in the margin zones — reliable when circles
-       are clearly in the outermost 20% of the sheet.
-    Returns (x_in_a, x_in_b) or None if nothing found.
+    Find the exact x-position of the split gridline by scanning vector paths.
+    Looks for a long near-vertical line segment close to approx_x.
+    Returns refined x or approx_x if nothing found.
     """
-    # Method 1: continuation note
-    cx_a = find_continuation_boundary(page_a, 'right')
-    cx_b = find_continuation_boundary(page_b, 'left')
-    if cx_a is not None and cx_b is not None:
-        return cx_a, cx_b
-    if cx_a is not None:
-        # Use page_b fallback: 15% from left
-        return cx_a, page_b.rect.width * 0.15
-    if cx_b is not None:
-        # Use page_a fallback: 85% from left
-        return page_a.rect.width * 0.85, cx_b
+    ph = page.rect.height
+    min_span = ph * 0.45   # must span at least 45% of page height
 
-    # Method 2: shared grid circle labels — widen margin to 20%
-    right_of_a = extract_margin_grid_refs(page_a, 'right', margin=0.20)
-    left_of_b  = extract_margin_grid_refs(page_b, 'left',  margin=0.20)
-    shared = set(right_of_a.keys()) & set(left_of_b.keys())
-    if shared:
-        x_a = max(right_of_a[r] for r in shared)
-        x_b = min(left_of_b[r]  for r in shared)
-        return x_a, x_b
+    best_x      = None
+    best_length = 0
 
-    return None
+    try:
+        for path in page.get_drawings():
+            items = path.get("items", [])
+            pts   = []
+            for item in items:
+                if item[0] in ("m", "l"):
+                    pts.append(item[1])
+                elif item[0] == "c":
+                    pts.extend([item[1], item[3]])   # control + end
+
+            if len(pts) < 2:
+                continue
+
+            xs = [p.x for p in pts]
+            ys = [p.y for p in pts]
+            x_range = max(xs) - min(xs)
+            y_range = max(ys) - min(ys)
+            avg_x   = (max(xs) + min(xs)) / 2
+
+            # Long near-vertical line close to approx_x
+            if (x_range < 20 and y_range > min_span
+                    and abs(avg_x - approx_x) < search_margin
+                    and y_range > best_length):
+                best_length = y_range
+                best_x      = avg_x
+    except Exception:
+        pass   # get_drawings can fail on some PDFs
+
+    return best_x if best_x is not None else approx_x
 
 
 def has_continuation_note(page):
-    """Check if the page contains a FOR CONTINUATION note (confirms split-sheet pairing)."""
+    """True if page contains a FOR CONTINUATION note."""
     for block in page.get_text("dict")["blocks"]:
         if block.get("type") != 0:
             continue
@@ -303,43 +266,39 @@ def has_continuation_note(page):
             for line in block.get("lines", [])
             for span in line.get("spans", [])
         ).upper()
-        if "FOR CONTINUATION" in text or "SEE DRAWING" in text:
+        if "FOR CONTINUATION" in text:
             return True
     return False
 
 
 def build_sheet_pairs(saved_paths, file_draw_types, file_docs):
     """
-    Identify pairs of split-sheet plan drawings for the same floor.
+    Identify pairs of split-sheet plan drawings and determine the exact
+    x-position of the shared gridline on each sheet.
 
-    OVERLAP ZONE STRATEGY:
-    Rather than trying to pinpoint the exact shared gridline (unreliable
-    in busy CAD drawings full of similar numbers), we use generous fixed
-    zones: right 25% of sheet A and left 25% of sheet B.
+    Returns list of dicts:
+      { 'fn_a': sheet1_filename,  'fn_b': sheet2_filename,
+        'gridline_x_a': float,    'gridline_x_b': float,
+        'strip_width': float,     'method': str }
 
-    A unit is only removed when the SAME ref appears in BOTH zones — so
-    there are no false removals for refs that are genuinely only on one sheet.
-    Sheet A (lower sheet number) always wins ties.
-
-    Returns list of dicts with 'fn_a', 'fn_b', 'boundary_x_a', 'boundary_x_b'.
+    gridline_x_b is the x on sheet B where the strip centred around
+    it defines the no-markup zone.
     """
-    OVERLAP_FRACTION = 0.25   # treat outer 25% of each sheet as potential overlap zone
+    STRIP_WIDTH   = 150   # half-width of no-markup strip in PDF units (~15mm at 1:100)
+    FALLBACK_FRAC = 0.08  # 8% from edge if all detection fails
 
     pairs = []
     plan_files = [(fn, ip) for fn, ip in saved_paths
-                  if file_draw_types.get(fn) in ('PLAN', 'UNKNOWN')]
+                  if file_draw_types.get(fn) in ("PLAN", "UNKNOWN")]
 
-    # Group by floor level
     by_floor = defaultdict(list)
     for fn, ip in plan_files:
-        lvl = extract_floor_level(fn)
-        by_floor[lvl].append((fn, ip))
+        by_floor[extract_floor_level(fn)].append((fn, ip))
 
     for lvl, floor_files in by_floor.items():
         if len(floor_files) < 2:
             continue
 
-        # Find files that declare themselves as part of a multi-sheet set
         sheet_numbered = []
         for fn, ip in floor_files:
             sn = get_sheet_number(fn)
@@ -349,108 +308,113 @@ def build_sheet_pairs(saved_paths, file_draw_types, file_docs):
         if len(sheet_numbered) >= 2:
             sheet_numbered.sort(key=lambda x: x[2])
             for k in range(len(sheet_numbered) - 1):
-                fn_a, ip_a, sn_a, _ = sheet_numbered[k]
-                fn_b, ip_b, sn_b, _ = sheet_numbered[k + 1]
+                fn_a, _,  sn_a, _ = sheet_numbered[k]
+                fn_b, _,  sn_b, _ = sheet_numbered[k + 1]
                 doc_a = file_docs.get(fn_a)
                 doc_b = file_docs.get(fn_b)
                 if not doc_a or not doc_b:
                     continue
-                pw_a = doc_a[0].rect.width
-                pw_b = doc_b[0].rect.width
-                # Confirm with continuation note (extra confidence, not required)
-                method = 'sheet_number'
-                if has_continuation_note(doc_a[0]) or has_continuation_note(doc_b[0]):
-                    method = 'sheet_number+continuation'
+
+                page_a = doc_a[0]
+                page_b = doc_b[0]
+                pw_a   = page_a.rect.width
+                pw_b   = page_b.rect.width
+
+                # Step 1: approximate boundary from continuation note
+                approx_a = find_continuation_x(page_a, "right") or pw_a * (1 - FALLBACK_FRAC)
+                approx_b = find_continuation_x(page_b, "left")  or pw_b * FALLBACK_FRAC
+
+                # Step 2: refine using actual vector gridline
+                gx_a = refine_gridline_x(page_a, approx_a)
+                gx_b = refine_gridline_x(page_b, approx_b)
+
+                method = "sheet_number"
+                if has_continuation_note(page_a) or has_continuation_note(page_b):
+                    method = "sheet_number+continuation+vector"
+
                 pairs.append({
-                    'fn_a': fn_a, 'fn_b': fn_b,
-                    'boundary_x_a': pw_a * (1.0 - OVERLAP_FRACTION),
-                    'boundary_x_b': pw_b * OVERLAP_FRACTION,
-                    'method': method
+                    "fn_a":        fn_a,
+                    "fn_b":        fn_b,
+                    "gridline_x_a": gx_a,
+                    "gridline_x_b": gx_b,
+                    "strip_width": STRIP_WIDTH,
+                    "method":      method,
                 })
+
         else:
-            # No sheet numbers in filenames — use continuation notes to confirm pairing
+            # No sheet numbers — use continuation notes to identify pairs
             for i in range(len(floor_files)):
                 for j in range(i + 1, len(floor_files)):
-                    fn_a, ip_a = floor_files[i]
-                    fn_b, ip_b = floor_files[j]
-                    doc_a = file_docs.get(fn_a)
-                    doc_b = file_docs.get(fn_b)
+                    fn_a, _ = floor_files[i]
+                    fn_b, _ = floor_files[j]
+                    doc_a   = file_docs.get(fn_a)
+                    doc_b   = file_docs.get(fn_b)
                     if not doc_a or not doc_b:
                         continue
-                    has_a = has_continuation_note(doc_a[0])
-                    has_b = has_continuation_note(doc_b[0])
-                    if has_a or has_b:
-                        pw_a = doc_a[0].rect.width
-                        pw_b = doc_b[0].rect.width
-                        pairs.append({
-                            'fn_a': fn_a, 'fn_b': fn_b,
-                            'boundary_x_a': pw_a * (1.0 - OVERLAP_FRACTION),
-                            'boundary_x_b': pw_b * OVERLAP_FRACTION,
-                            'method': 'continuation_note'
-                        })
+                    if not (has_continuation_note(doc_a[0]) or
+                            has_continuation_note(doc_b[0])):
+                        continue
+
+                    pw_a  = doc_a[0].rect.width
+                    pw_b  = doc_b[0].rect.width
+                    approx_a = find_continuation_x(doc_a[0], "right") or pw_a * (1 - FALLBACK_FRAC)
+                    approx_b = find_continuation_x(doc_b[0], "left")  or pw_b * FALLBACK_FRAC
+                    gx_a  = refine_gridline_x(doc_a[0], approx_a)
+                    gx_b  = refine_gridline_x(doc_b[0], approx_b)
+
+                    pairs.append({
+                        "fn_a":        fn_a,
+                        "fn_b":        fn_b,
+                        "gridline_x_a": gx_a,
+                        "gridline_x_b": gx_b,
+                        "strip_width": STRIP_WIDTH,
+                        "method":      "continuation+vector",
+                    })
     return pairs
 
 
-def deduplicate_sheet_overlaps(plan_insts, sheet_pairs, logs):
+def apply_boundary_strip(plan_insts, sheet_pairs, all_searched, file_docs_closed, logs):
     """
-    Remove duplicate instances in the overlap zone between paired sheets.
-    For each pair, instances past the boundary in sheet A or before the
-    boundary in sheet B are in the overlap zone.  When the same ref appears
-    in the overlap zone of both sheets, keep the instance that is further
-    from the shared edge (i.e. more central to its own sheet).
+    For each sheet pair, mark instances on sheet B (the right-hand sheet) whose
+    text label falls inside the boundary strip as outline-only.
+
+    The strip is centred on the detected split gridline x on sheet B.
+    Sheet A is untouched — it owns the boundary.
+
+    Since docs are closed by this point, we use the instance cx values
+    (collected during the scan pass) to check strip membership.
     """
-    if not sheet_pairs or len({i['filename'] for i in plan_insts}) < 2:
+    if not sheet_pairs:
         return plan_insts
 
-    to_remove = set()
-    by_file = defaultdict(list)
-    for inst in plan_insts:
-        by_file[inst['filename']].append(inst)
-
+    # Build lookup: fn_b -> (gridline_x_b, strip_width)
+    b_strips = {}
     for pair in sheet_pairs:
-        fn_a = pair['fn_a']
-        fn_b = pair['fn_b']
-        bx_a = pair['boundary_x_a']   # right-side boundary in sheet A
-        bx_b = pair['boundary_x_b']   # left-side boundary in sheet B
-        method = pair.get('method', 'fallback')
+        b_strips[pair["fn_b"]] = (pair["gridline_x_b"], pair["strip_width"])
 
-        insts_a = by_file.get(fn_a, [])
-        insts_b = by_file.get(fn_b, [])
+    marked = 0
+    for inst in plan_insts:
+        fn = inst["filename"]
+        if fn not in b_strips:
+            continue
+        gx_b, sw = b_strips[fn]
+        # Check if this instance's text position is inside the boundary strip
+        if abs(inst["cx"] - gx_b) <= sw:
+            if inst["ann_type"] != "outline":   # don't double-mark
+                inst["ann_type"] = "outline"
+                marked += 1
 
-        overlap_a = [i for i in insts_a if i['cx'] >= bx_a and id(i) not in to_remove]
-        overlap_b = [i for i in insts_b if i['cx'] <= bx_b and id(i) not in to_remove]
+    if marked > 0:
+        logs.append(
+            f"  ↳ Boundary strip: {marked} instance(s) on sheet-2 side "
+            f"→ outline-only (sheet 1 owns the gridline)"
+        )
+    return plan_insts
 
-        removed = 0
-        for ia in overlap_a:
-            for ib in overlap_b:
-                if ia['ref'] != ib['ref']:
-                    continue
-                # Same ref in overlap zone of both sheets.
-                # Tiebreaker rule: sheet A (lower sheet number) always owns
-                # the boundary — remove the sheet B instance on any tie.
-                # Only keep sheet B instance if it is STRICTLY further from
-                # the boundary than sheet A (meaning it is clearly more central
-                # to sheet B and sheet A's instance is closer to the edge).
-                dist_a = abs(ia['cx'] - bx_a)  # distance from boundary in A
-                dist_b = abs(ib['cx'] - bx_b)  # distance from boundary in B
-                if dist_a < dist_b:
-                    # Sheet A instance is closer to boundary — remove it
-                    to_remove.add(id(ia))
-                else:
-                    # Sheet A instance is further from (or equal to) boundary
-                    # → it is more central to sheet A, keep it, remove sheet B
-                    to_remove.add(id(ib))
-                removed += 1
 
-        if removed > 0:
-            logs.append(
-                f"  ↳ Split-sheet dedup [{method}]: "
-                f"{os.path.basename(fn_a)} / {os.path.basename(fn_b)} "
-                f"— removed {removed} overlap duplicate(s)"
-            )
-
-    return [i for i in plan_insts if id(i) not in to_remove]
-
+def deduplicate_sheet_overlaps(plan_insts, sheet_pairs, logs):
+    """Legacy stub — boundary strip logic replaced this function."""
+    return plan_insts
 # ===========================================================================
 # INPUT PARSERS
 # ===========================================================================
@@ -701,9 +665,10 @@ def process():
         if sheet_pairs:
             for p in sheet_pairs:
                 logs.append(
-                    f"  ↳ Split-sheet pair detected [{p['method']}]: "
+                    f"  ↳ Split-sheet pair [{p['method']}]: "
                     f"{os.path.basename(p['fn_a'])} ↔ {os.path.basename(p['fn_b'])} "
-                    f"(boundary x={p['boundary_x_a']:.0f} / {p['boundary_x_b']:.0f})"
+                    f"| gridline x: sheet1={p['gridline_x_a']:.0f}, "
+                    f"sheet2={p['gridline_x_b']:.0f}, strip±{p['strip_width']:.0f}"
                 )
 
         # Close docs after pair detection — no longer needed until annotation pass
@@ -762,8 +727,8 @@ def process():
 
             # ---- PLAN / UNKNOWN ---------------------------------------------
             if plan_insts:
-                # Deduplicate overlapping split-sheet instances using detected pairs
-                plan_insts = deduplicate_sheet_overlaps(plan_insts, sheet_pairs, logs)
+                # Apply boundary strip — sheet 2 instances near split gridline → outline
+                plan_insts = apply_boundary_strip(plan_insts, sheet_pairs, all_searched, {}, logs)
 
                 # Sort: floor level ascending, then heat centroid distance within floor
                 def plan_key(i):
@@ -773,22 +738,24 @@ def process():
 
                 plan_insts.sort(key=plan_key)
 
-                for k, inst in enumerate(plan_insts):
-                    if k < q:
+                # Apply quota — respect boundary-strip outlines already assigned.
+                # Only instances still marked 'highlight' compete for the quota.
+                highlight_count = 0
+                for inst in plan_insts:
+                    if inst['ann_type'] == 'outline':
+                        continue  # boundary strip or prior assignment — leave as outline
+                    if highlight_count < q:
                         inst['ann_type'] = 'highlight'
+                        highlight_count += 1
                     else:
                         inst['ann_type'] = 'outline'
 
-                if len(plan_insts) > q:
+                outline_count = len(plan_insts) - highlight_count
+                if outline_count > 0 or highlight_count < q:
                     logs.append(
                         f"  ↳ '{ref}': {len(plan_insts)} plan instances "
-                        f"(after dedup), marking {q} lowest-floor-first "
-                        f"+ {len(plan_insts)-q} outlined"
-                    )
-                elif len(plan_insts) < q:
-                    logs.append(
-                        f"  ⚠ '{ref}': plan quota {q}, "
-                        f"only {len(plan_insts)} instance(s) found after dedup"
+                        f"→ {highlight_count} highlighted, {outline_count} outlined"
+                        + (f" (quota {q} not fully met)" if highlight_count < q else "")
                     )
                 selected_instances.extend(plan_insts)
 
