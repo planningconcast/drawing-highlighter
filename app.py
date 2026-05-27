@@ -359,12 +359,20 @@ def deduplicate_sheet_overlaps(plan_insts, sheet_pairs, logs):
             for ib in overlap_b:
                 if ia['ref'] != ib['ref']:
                     continue
-                # Same ref in overlap zone of both sheets — keep the more central one
+                # Same ref in overlap zone of both sheets.
+                # Tiebreaker rule: sheet A (lower sheet number) always owns
+                # the boundary — remove the sheet B instance on any tie.
+                # Only keep sheet B instance if it is STRICTLY further from
+                # the boundary than sheet A (meaning it is clearly more central
+                # to sheet B and sheet A's instance is closer to the edge).
                 dist_a = abs(ia['cx'] - bx_a)  # distance from boundary in A
                 dist_b = abs(ib['cx'] - bx_b)  # distance from boundary in B
-                if dist_a <= dist_b:
+                if dist_a < dist_b:
+                    # Sheet A instance is closer to boundary — remove it
                     to_remove.add(id(ia))
                 else:
+                    # Sheet A instance is further from (or equal to) boundary
+                    # → it is more central to sheet A, keep it, remove sheet B
                     to_remove.add(id(ib))
                 removed += 1
 
