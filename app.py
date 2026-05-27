@@ -293,15 +293,38 @@ def find_shared_gridline(page_a, page_b):
     return None
 
 
+def has_continuation_note(page):
+    """Check if the page contains a FOR CONTINUATION note (confirms split-sheet pairing)."""
+    for block in page.get_text("dict")["blocks"]:
+        if block.get("type") != 0:
+            continue
+        text = " ".join(
+            span["text"]
+            for line in block.get("lines", [])
+            for span in line.get("spans", [])
+        ).upper()
+        if "FOR CONTINUATION" in text or "SEE DRAWING" in text:
+            return True
+    return False
+
+
 def build_sheet_pairs(saved_paths, file_draw_types, file_docs):
     """
     Identify pairs of split-sheet plan drawings for the same floor.
-    Returns list of dicts:
-      { 'fn_a': filename, 'fn_b': filename,
-        'boundary_x_a': float, 'boundary_x_b': float }
-    boundary_x_a = x in sheet A beyond which is the overlap zone (right side)
-    boundary_x_b = x in sheet B below which is the overlap zone (left side)
+
+    OVERLAP ZONE STRATEGY:
+    Rather than trying to pinpoint the exact shared gridline (unreliable
+    in busy CAD drawings full of similar numbers), we use generous fixed
+    zones: right 25% of sheet A and left 25% of sheet B.
+
+    A unit is only removed when the SAME ref appears in BOTH zones — so
+    there are no false removals for refs that are genuinely only on one sheet.
+    Sheet A (lower sheet number) always wins ties.
+
+    Returns list of dicts with 'fn_a', 'fn_b', 'boundary_x_a', 'boundary_x_b'.
     """
+    OVERLAP_FRACTION = 0.25   # treat outer 25% of each sheet as potential overlap zone
+
     pairs = []
     plan_files = [(fn, ip) for fn, ip in saved_paths
                   if file_draw_types.get(fn) in ('PLAN', 'UNKNOWN')]
@@ -324,41 +347,28 @@ def build_sheet_pairs(saved_paths, file_draw_types, file_docs):
                 sheet_numbered.append((fn, ip, sn[0], sn[1]))
 
         if len(sheet_numbered) >= 2:
-            # Sort by sheet number and pair consecutive sheets
             sheet_numbered.sort(key=lambda x: x[2])
             for k in range(len(sheet_numbered) - 1):
                 fn_a, ip_a, sn_a, _ = sheet_numbered[k]
                 fn_b, ip_b, sn_b, _ = sheet_numbered[k + 1]
-
                 doc_a = file_docs.get(fn_a)
                 doc_b = file_docs.get(fn_b)
                 if not doc_a or not doc_b:
                     continue
-
-                page_a = doc_a[0]
-                page_b = doc_b[0]
-                result = find_shared_gridline(page_a, page_b)
-
-                if result:
-                    bx_a, bx_b = result
-                    pairs.append({
-                        'fn_a': fn_a, 'fn_b': fn_b,
-                        'boundary_x_a': bx_a,
-                        'boundary_x_b': bx_b,
-                        'method': 'gridline'
-                    })
-                else:
-                    # Fallback: use page-width fraction as boundary
-                    pw_a = doc_a[0].rect.width
-                    pw_b = doc_b[0].rect.width
-                    pairs.append({
-                        'fn_a': fn_a, 'fn_b': fn_b,
-                        'boundary_x_a': pw_a * 0.85,
-                        'boundary_x_b': pw_b * 0.15,
-                        'method': 'fallback'
-                    })
+                pw_a = doc_a[0].rect.width
+                pw_b = doc_b[0].rect.width
+                # Confirm with continuation note (extra confidence, not required)
+                method = 'sheet_number'
+                if has_continuation_note(doc_a[0]) or has_continuation_note(doc_b[0]):
+                    method = 'sheet_number+continuation'
+                pairs.append({
+                    'fn_a': fn_a, 'fn_b': fn_b,
+                    'boundary_x_a': pw_a * (1.0 - OVERLAP_FRACTION),
+                    'boundary_x_b': pw_b * OVERLAP_FRACTION,
+                    'method': method
+                })
         else:
-            # No sheet numbers — try all pairs using gridline detection only
+            # No sheet numbers in filenames — use continuation notes to confirm pairing
             for i in range(len(floor_files)):
                 for j in range(i + 1, len(floor_files)):
                     fn_a, ip_a = floor_files[i]
@@ -367,14 +377,16 @@ def build_sheet_pairs(saved_paths, file_draw_types, file_docs):
                     doc_b = file_docs.get(fn_b)
                     if not doc_a or not doc_b:
                         continue
-                    result = find_shared_gridline(doc_a[0], doc_b[0])
-                    if result:
-                        bx_a, bx_b = result
+                    has_a = has_continuation_note(doc_a[0])
+                    has_b = has_continuation_note(doc_b[0])
+                    if has_a or has_b:
+                        pw_a = doc_a[0].rect.width
+                        pw_b = doc_b[0].rect.width
                         pairs.append({
                             'fn_a': fn_a, 'fn_b': fn_b,
-                            'boundary_x_a': bx_a,
-                            'boundary_x_b': bx_b,
-                            'method': 'gridline'
+                            'boundary_x_a': pw_a * (1.0 - OVERLAP_FRACTION),
+                            'boundary_x_b': pw_b * OVERLAP_FRACTION,
+                            'method': 'continuation_note'
                         })
     return pairs
 
