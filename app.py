@@ -271,6 +271,25 @@ def has_continuation_note(page):
     return False
 
 
+def get_drawing_page(doc):
+    """
+    Return the main drawing page from a multi-page PDF.
+    Skips cover/title pages by finding the page with the most text blocks,
+    which correlates with dense CAD drawing content.
+    Falls back to page 0 if only one page or all equal.
+    """
+    if len(doc) == 1:
+        return doc[0]
+    best_page  = doc[0]
+    best_count = 0
+    for i in range(len(doc)):
+        count = len(doc[i].get_text("dict").get("blocks", []))
+        if count > best_count:
+            best_count = count
+            best_page  = doc[i]
+    return best_page
+
+
 def build_sheet_pairs(saved_paths, file_draw_types, file_docs):
     """
     Identify pairs of split-sheet plan drawings and determine the exact
@@ -315,8 +334,8 @@ def build_sheet_pairs(saved_paths, file_draw_types, file_docs):
                 if not doc_a or not doc_b:
                     continue
 
-                page_a = doc_a[0]
-                page_b = doc_b[0]
+                page_a = get_drawing_page(doc_a)
+                page_b = get_drawing_page(doc_b)
                 pw_a   = page_a.rect.width
                 pw_b   = page_b.rect.width
 
@@ -351,16 +370,17 @@ def build_sheet_pairs(saved_paths, file_draw_types, file_docs):
                     doc_b   = file_docs.get(fn_b)
                     if not doc_a or not doc_b:
                         continue
-                    if not (has_continuation_note(doc_a[0]) or
-                            has_continuation_note(doc_b[0])):
+                    pa_main = get_drawing_page(doc_a)
+                    pb_main = get_drawing_page(doc_b)
+                    if not (has_continuation_note(pa_main) or
+                            has_continuation_note(pb_main)):
                         continue
-
-                    pw_a  = doc_a[0].rect.width
-                    pw_b  = doc_b[0].rect.width
-                    approx_a = find_continuation_x(doc_a[0], "right") or pw_a * (1 - FALLBACK_FRAC)
-                    approx_b = find_continuation_x(doc_b[0], "left")  or pw_b * FALLBACK_FRAC
-                    gx_a  = refine_gridline_x(doc_a[0], approx_a)
-                    gx_b  = refine_gridline_x(doc_b[0], approx_b)
+                    pw_a  = pa_main.rect.width
+                    pw_b  = pb_main.rect.width
+                    approx_a = find_continuation_x(pa_main, "right") or pw_a * (1 - FALLBACK_FRAC)
+                    approx_b = find_continuation_x(pb_main, "left")  or pw_b * FALLBACK_FRAC
+                    gx_a  = refine_gridline_x(pa_main, approx_a)
+                    gx_b  = refine_gridline_x(pb_main, approx_b)
 
                     pairs.append({
                         "fn_a":        fn_a,
@@ -373,7 +393,7 @@ def build_sheet_pairs(saved_paths, file_draw_types, file_docs):
     return pairs
 
 
-def apply_boundary_strip(plan_insts, sheet_pairs, all_searched, file_docs_closed, logs):
+def apply_boundary_strip(plan_insts, sheet_pairs, logs):
     """
     For each sheet pair, mark instances on sheet B (the right-hand sheet) whose
     text label falls inside the boundary strip as outline-only.
@@ -567,11 +587,12 @@ def process():
         sorted_pfx = sorted(detected_prefixes, key=len, reverse=True)
         pfx_str    = '|'.join(re.escape(p) for p in sorted_pfx)
         has_hyphen = any('-' in item for item in all_searched)
-        unit_pattern = re.compile(
-            r'\b(?:' + pfx_str + (r')\-\d+\b' if has_hyphen else r')\d+\b')
-        )
+        if has_hyphen:
+            unit_pattern = re.compile(rf'\b(?:{pfx_str})-\d+\b')
+        else:
+            unit_pattern = re.compile(rf'\b(?:{pfx_str})\d+\b')
     else:
-        unit_pattern = re.compile(r'\b[A-Z]{2,4}\-\d+\b')
+        unit_pattern = re.compile(r'\b[A-Z]{2,4}-\d+\b')
 
     total_issued    = sum(1 for l in issued_raw.splitlines()    if l.strip())
     total_produced  = sum(1 for l in produced_raw.splitlines()  if l.strip())
@@ -728,7 +749,7 @@ def process():
             # ---- PLAN / UNKNOWN ---------------------------------------------
             if plan_insts:
                 # Apply boundary strip — sheet 2 instances near split gridline → outline
-                plan_insts = apply_boundary_strip(plan_insts, sheet_pairs, all_searched, {}, logs)
+                plan_insts = apply_boundary_strip(plan_insts, sheet_pairs, logs)
 
                 # Sort: floor level ascending, then heat centroid distance within floor
                 def plan_key(i):
