@@ -222,20 +222,74 @@ def extract_margin_grid_refs(page, side, margin=0.08):
     return refs
 
 
+def find_continuation_boundary(page, side):
+    """
+    Look for 'FOR CONTINUATION SEE DRAWING' text on the given side of the page.
+    These notes appear right at the shared edge on split-sheet drawings.
+    Returns the x-centre of the text block, or None.
+    side: 'right' or 'left'
+    """
+    pw = page.rect.width
+    ph = page.rect.height
+    # Search entire width but only relevant horizontal half
+    if side == 'right':
+        zone = fitz.Rect(pw * 0.5, 0, pw, ph)
+    else:
+        zone = fitz.Rect(0, 0, pw * 0.5, ph)
+
+    for block in page.get_text("dict")["blocks"]:
+        if block.get("type") != 0:
+            continue
+        br = fitz.Rect(block["bbox"])
+        if not zone.intersects(br):
+            continue
+        # Concatenate all span text in block
+        block_text = " ".join(
+            span["text"]
+            for line in block.get("lines", [])
+            for span in line.get("spans", [])
+        ).upper()
+        if "FOR CONTINUATION" in block_text or "SEE DRAWING" in block_text:
+            # Return x position of this block (left edge = the boundary line)
+            if side == 'right':
+                return block["bbox"][0]   # left edge of the continuation note
+            else:
+                return block["bbox"][2]   # right edge of the continuation note
+    return None
+
+
 def find_shared_gridline(page_a, page_b):
     """
-    Find the x-position of the shared gridline between two adjacent sheets.
-    sheet A's right margin grid refs are compared with sheet B's left margin.
-    Returns (x_in_a, x_in_b) or None if no shared refs found.
+    Find the x-position of the shared edge between two adjacent sheets.
+
+    Detection methods in priority order:
+    1. 'FOR CONTINUATION SEE DRAWING' text block — appears right at the
+       shared edge on structural drawings, most reliable.
+    2. Shared grid circle labels in the margin zones — reliable when circles
+       are clearly in the outermost 20% of the sheet.
+    Returns (x_in_a, x_in_b) or None if nothing found.
     """
-    right_of_a = extract_margin_grid_refs(page_a, 'right')
-    left_of_b  = extract_margin_grid_refs(page_b, 'left')
+    # Method 1: continuation note
+    cx_a = find_continuation_boundary(page_a, 'right')
+    cx_b = find_continuation_boundary(page_b, 'left')
+    if cx_a is not None and cx_b is not None:
+        return cx_a, cx_b
+    if cx_a is not None:
+        # Use page_b fallback: 15% from left
+        return cx_a, page_b.rect.width * 0.15
+    if cx_b is not None:
+        # Use page_a fallback: 85% from left
+        return page_a.rect.width * 0.85, cx_b
+
+    # Method 2: shared grid circle labels — widen margin to 20%
+    right_of_a = extract_margin_grid_refs(page_a, 'right', margin=0.20)
+    left_of_b  = extract_margin_grid_refs(page_b, 'left',  margin=0.20)
     shared = set(right_of_a.keys()) & set(left_of_b.keys())
     if shared:
-        # Use the rightmost shared ref in A and leftmost in B
         x_a = max(right_of_a[r] for r in shared)
         x_b = min(left_of_b[r]  for r in shared)
         return x_a, x_b
+
     return None
 
 
