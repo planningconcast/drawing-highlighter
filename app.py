@@ -121,6 +121,122 @@ def detect_drawing_type(filename, pages):
         if PLAN_RE.search(full): return 'PLAN'
     return 'UNKNOWN'
 
+
+# ===========================================================================
+# DOCK PROJECT DETECTION & MULTI-VIEW SECTION PARSING
+# ===========================================================================
+DOCK_RE       = re.compile(r'\bDOCK\b', re.IGNORECASE)
+PLAN_TITLE_RE = re.compile(
+    r'(dock\s+(?:foundation\s+)?(?:slab\s+)?plan'
+    r'|yard\s+wall\s+plan'
+    r'|wing\s+walls?\s+plan'
+    r'|hub\s+plan)',
+    re.IGNORECASE
+)
+ELEV_TITLE_RE = re.compile(
+    r'(dock\s+elevation'
+    r'|wing\s+walls?\s+elevation'
+    r'|hub\s+elevation'
+    r'|yard\s+walls?\s+elevation)',
+    re.IGNORECASE
+)
+DOCK_BAY_RE = re.compile(r'GL\s+([A-Z]+)/(\d+)-(\d+)', re.IGNORECASE)
+
+
+def is_dock_project(filename, page_texts):
+    combined = re.sub(r'[-_.]', ' ', filename.upper())
+    for pt in page_texts[:2]:
+        combined += ' ' + pt[:2000].upper()
+    return bool(DOCK_RE.search(combined))
+
+
+def get_dock_view_sections(page):
+    titles = []
+    for block in page.get_text('dict')['blocks']:
+        if block.get('type') != 0:
+            continue
+        text = ' '.join(
+            span['text']
+            for line in block.get('lines', [])
+            for span in line.get('spans', [])
+        )
+        y_bot = block['bbox'][3]
+        if PLAN_TITLE_RE.search(text):
+            titles.append(('PLAN', y_bot))
+        elif ELEV_TITLE_RE.search(text):
+            titles.append(('ELEVATION', y_bot))
+    if not titles:
+        return None
+    titles.sort(key=lambda t: t[1])
+    sections = []
+    y_start = 0.0
+    for kind, y_bot in titles:
+        sections.append({'type': kind, 'y_min': y_start, 'y_max': y_bot})
+        y_start = y_bot
+    return sections
+
+
+def section_type_at(cy, sections):
+    if not sections:
+        return 'PLAN'
+    for sec in sections:
+        if sec['y_min'] <= cy <= sec['y_max']:
+            return sec['type']
+    return 'PLAN'
+
+
+def get_dock_bay_range(filename, page_text):
+    combined = filename + ' ' + page_text[:1000]
+    m = DOCK_BAY_RE.search(combined)
+    if m:
+        return m.group(1).upper(), int(m.group(2)), int(m.group(3))
+    return None
+
+
+def build_dock_sheet_pairs(saved_paths, file_draw_types, file_docs):
+    STRIP_WIDTH   = 150
+    FALLBACK_FRAC = 0.08
+    by_gridline = defaultdict(list)
+    for fn, ip in saved_paths:
+        doc = file_docs.get(fn)
+        if not doc:
+            continue
+        page_text = get_drawing_page(doc).get_text('text')
+        bay_range = get_dock_bay_range(fn, page_text)
+        if bay_range:
+            gl, bstart, bend = bay_range
+            by_gridline[gl].append((fn, bstart, bend))
+    pairs = []
+    for gl, drawings in by_gridline.items():
+        drawings.sort(key=lambda x: x[1])
+        for k in range(len(drawings) - 1):
+            fn_a, sa, ea = drawings[k]
+            fn_b, sb, eb = drawings[k + 1]
+            if ea != sb:
+                continue
+            doc_a = file_docs.get(fn_a)
+            doc_b = file_docs.get(fn_b)
+            if not doc_a or not doc_b:
+                continue
+            pa   = get_drawing_page(doc_a)
+            pb   = get_drawing_page(doc_b)
+            pw_a = pa.rect.width
+            pw_b = pb.rect.width
+            approx_a = find_continuation_x(pa, 'right') or pw_a * (1 - FALLBACK_FRAC)
+            approx_b = find_continuation_x(pb, 'left')  or pw_b * FALLBACK_FRAC
+            gx_a = refine_gridline_x(pa, approx_a)
+            gx_b = refine_gridline_x(pb, approx_b)
+            pairs.append({
+                'fn_a':         fn_a,
+                'fn_b':         fn_b,
+                'gridline_x_a': gx_a,
+                'gridline_x_b': gx_b,
+                'strip_width':  STRIP_WIDTH,
+                'method':       'dock_gl_{}_bay_{}'.format(gl, ea),
+            })
+    return pairs
+
+
 # ===========================================================================
 # HEAT AREA DETECTION (plan drawings)
 # ===========================================================================
@@ -630,24 +746,32 @@ def process():
             upload.save(in_path)
             saved_paths.append((filename, in_path))
 
-        file_docs = {}  # keep docs open for sheet-pair gridline detection
+        file_docs    = {}  # keep docs open for sheet-pair gridline detection
+        file_is_dock = {}  # filename -> bool
 
         for filename, in_path in saved_paths:
             try:
-                doc  = fitz.open(in_path)
+                doc   = fitz.open(in_path)
                 pages = [doc[i] for i in range(len(doc))]
-                draw_type = detect_drawing_type(filename, pages)
+                page_texts = [p.get_text('text') for p in pages]
+                dock        = is_dock_project(filename, page_texts)
+                file_is_dock[filename] = dock
+                # For dock drawings, classify as DOCK (mixed view) not PLAN/ELEV
+                draw_type = 'DOCK' if dock else detect_drawing_type(filename, pages)
                 file_draw_types[filename] = draw_type
                 floor_lvl = extract_floor_level(filename)
                 logs.append(f"Scanning: {filename} [{draw_type}, floor {floor_lvl}]")
 
                 for page_idx, page in enumerate(pages):
                     file_page_dims[filename] = (page.rect.width, page.rect.height)
-                    elevations = extract_elevations(page)
+                    elevations    = extract_elevations(page)
+                    # For dock drawings, detect which y-bands are PLAN vs ELEVATION
+                    view_sections = get_dock_view_sections(page) if dock else None
                     for ref in all_searched:
                         for inst in page.search_for(ref):
                             cx = (inst.x0 + inst.x1) / 2
                             cy = (inst.y0 + inst.y1) / 2
+                            sec_type = section_type_at(cy, view_sections) if dock else None
                             all_candidates[ref].append({
                                 'ref':        ref,
                                 'filename':   filename,
@@ -658,17 +782,20 @@ def process():
                                 'cx': cx, 'cy': cy,
                                 'draw_type':  draw_type,
                                 'floor_lvl':  floor_lvl,
+                                'sec_type':   sec_type,   # 'PLAN'|'ELEVATION'|None
                                 'load_no':    None,
-                                'ann_type':   'highlight',  # or 'outline'
+                                'ann_type':   'highlight',
                             })
-                            all_unit_pos_by_file[filename].append((cx, cy))
-                file_docs[filename] = doc  # keep open for pair detection
+                            # Only count plan-zone instances toward heat map
+                            if sec_type != 'ELEVATION':
+                                all_unit_pos_by_file[filename].append((cx, cy))
+                file_docs[filename] = doc
             except Exception as e:
                 logs.append(f"ERROR scanning {filename}: {e}")
 
-        # Compute heat centroids for plan drawings
+        # Compute heat centroids for plan and dock drawings
         for filename, in_path in saved_paths:
-            if file_draw_types.get(filename) == 'PLAN':
+            if file_draw_types.get(filename) in ('PLAN', 'DOCK'):
                 try:
                     pw, ph = file_page_dims.get(filename, (1000, 1000))
                     positions = all_unit_pos_by_file[filename]
@@ -681,8 +808,17 @@ def process():
                 except Exception:
                     file_heat_centroids[filename] = None
 
-        # Build split-sheet pairs for overlap deduplication
-        sheet_pairs = build_sheet_pairs(saved_paths, file_draw_types, file_docs)
+        # Build split-sheet pairs — multi-storey (1 of 2) and dock (bay ranges)
+        sheet_pairs  = build_sheet_pairs(saved_paths, file_draw_types, file_docs)
+        dock_pairs   = build_dock_sheet_pairs(saved_paths, file_draw_types, file_docs)
+        sheet_pairs += dock_pairs
+        if dock_pairs:
+            for p in dock_pairs:
+                logs.append(
+                    f"  ↳ Dock bay pair [{p['method']}]: "
+                    f"{os.path.basename(p['fn_a'])} <-> {os.path.basename(p['fn_b'])} "
+                    f"| boundary x: A={p['gridline_x_a']:.0f}, B={p['gridline_x_b']:.0f}"
+                )
         if sheet_pairs:
             for p in sheet_pairs:
                 logs.append(
@@ -723,8 +859,77 @@ def process():
             if not instances:
                 continue
 
+            # Separate dock instances from traditional building instances
+            dock_insts = [i for i in instances if i['draw_type'] == 'DOCK']
             elev_insts = [i for i in instances if i['draw_type'] in ('ELEVATION', 'SECTION')]
             plan_insts = [i for i in instances if i['draw_type'] in ('PLAN', 'UNKNOWN')]
+
+            # ---- DOCK DRAWINGS ------------------------------------------
+            # Each dock sheet has elevation (top) and plan (bottom) stacked.
+            #
+            # Rule:
+            #   - Ref found in plan AND elevation  -> highlight in plan,
+            #                                         outline in elevation
+            #   - Ref found ONLY in elevation      -> highlight in elevation
+            #     (e.g. sandwich panels, mullions, headers — no plan symbol)
+            #   - Ref found ONLY in plan           -> highlight in plan
+            if dock_insts:
+                dock_plan_raw = [i for i in dock_insts if i.get('sec_type') != 'ELEVATION']
+                dock_elev_raw = [i for i in dock_insts if i.get('sec_type') == 'ELEVATION']
+
+                has_plan_instances = len(dock_plan_raw) > 0
+
+                if has_plan_instances:
+                    # Ref has plan symbols — elevation instances become outlines
+                    for inst in dock_elev_raw:
+                        inst['ann_type'] = 'outline'
+
+                    # Apply boundary strip and quota to plan instances
+                    dock_plan_raw = apply_boundary_strip(dock_plan_raw, sheet_pairs, logs)
+
+                    def dock_plan_key(i):
+                        centroid = file_heat_centroids.get(i['filename'])
+                        return pdist((i['cx'], i['cy']), centroid) if centroid else 0
+
+                    dock_plan_raw.sort(key=dock_plan_key)
+
+                    hl = 0
+                    for inst in dock_plan_raw:
+                        if inst['ann_type'] == 'outline':
+                            continue
+                        if hl < q:
+                            inst['ann_type'] = 'highlight'
+                            hl += 1
+                        else:
+                            inst['ann_type'] = 'outline'
+
+                    logs.append(
+                        f"  -> '{ref}': plan-priority dock "
+                        f"[plan: {hl} highlighted, {len(dock_plan_raw)-hl} outlined | "
+                        f"elev: {len(dock_elev_raw)} outline-only]"
+                    )
+                    selected_instances.extend(dock_plan_raw)
+                    selected_instances.extend(dock_elev_raw)
+
+                else:
+                    # Ref appears ONLY in elevation (e.g. mullion, header panel)
+                    # Treat elevation as primary — apply quota bottom-up
+                    dock_elev_raw.sort(key=lambda i: (i['page_idx'], -i['cy']))
+                    dock_elev_raw = apply_boundary_strip(dock_elev_raw, sheet_pairs, logs)
+                    hl = 0
+                    for inst in dock_elev_raw:
+                        if inst['ann_type'] == 'outline':
+                            continue
+                        if hl < q:
+                            inst['ann_type'] = 'highlight'
+                            hl += 1
+                        else:
+                            inst['ann_type'] = 'outline'
+                    logs.append(
+                        f"  -> '{ref}': elevation-only dock "
+                        f"[{hl} highlighted bottom-up, {len(dock_elev_raw)-hl} outlined]"
+                    )
+                    selected_instances.extend(dock_elev_raw)
 
             # ---- ELEVATION / SECTION ----------------------------------------
             if elev_insts:
