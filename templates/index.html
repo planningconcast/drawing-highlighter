@@ -189,6 +189,12 @@
   .dl-btn.visible { display: flex; }
 
   @keyframes spin { to { transform: rotate(360deg); } }
+  .version-badge {
+    font-size: 10px; font-family: var(--font-mono);
+    color: var(--muted); background: rgba(255,255,255,0.04);
+    border: 0.5px solid var(--brown-rim); border-radius: 4px;
+    padding: 2px 7px; letter-spacing: 0.04em;
+  }
   .spinner {
     width: 14px; height: 14px;
     border: 1.5px solid rgba(255,255,255,0.15);
@@ -208,6 +214,7 @@
     <div>
       <div class="header-title">Drawing Highlighter</div>
       <div class="header-sub">Multi-priority PDF annotation &amp; audit</div>
+      <div class="version-badge" style="margin-top:6px;">v{{ app_version }} &nbsp;·&nbsp; {{ app_build }}</div>
     </div>
     <div class="legend">
       <div class="legend-item"><div class="dot dot-yellow"></div> Issued</div>
