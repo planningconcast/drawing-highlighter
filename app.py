@@ -589,7 +589,7 @@ def deduplicate_sheet_overlaps(plan_insts, sheet_pairs, logs):
 # (bottom-to-top within each column), then move left.
 # ===========================================================================
 LIFT_RE = re.compile(
-    r'\b(LIFT|SHAFT|LIFT[_\s]CORE|LIFT[_\s]SHAFT|STAIR|STAIRCASE|STAIR[_\s]CORE)\b',
+    r'\b(LIFT|SHAFT|LIFT[_\s]CORE|LIFT[_\s]SHAFT)\b',
     re.IGNORECASE
 )
 
@@ -599,6 +599,56 @@ def is_lift_drawing(filename, page_texts):
     for pt in page_texts[:2]:
         combined += ' ' + pt[:2000].upper()
     return bool(LIFT_RE.search(combined))
+
+
+
+STAIRCORE_RE = re.compile(
+    r'\b(STAIRCORE|STAIR[\s_-]+CORE|STAIR[\s_-]+SHAFT|STAIR[\s_-]+FLIGHT|STAIRCASE)\b',
+    re.IGNORECASE
+)
+STAIR_DETAIL_RE = re.compile(r'\bDETAIL\b', re.IGNORECASE)
+
+
+def is_staircore_drawing(filename, page_texts):
+    combined = re.sub(r'[-_.]', ' ', filename.upper())
+    for pt in page_texts[:2]:
+        combined += ' ' + pt[:2000].upper()
+    return bool(STAIRCORE_RE.search(combined))
+
+
+def get_staircore_detail_zones(page):
+    """
+    Find bounding zones of DETAIL views on a staircore section drawing.
+    Detail titles (e.g. 'Detail Section P1') sit below their view.
+    Each zone extends 800px upward from the title block — instances
+    inside a zone are in a detail view and should be outlined only.
+    Returns list of fitz.Rect zones.
+    """
+    pw, ph = page.rect.width, page.rect.height
+    zones  = []
+    for block in page.get_text('dict')['blocks']:
+        if block.get('type') != 0:
+            continue
+        text = ' '.join(
+            span['text']
+            for line in block.get('lines', [])
+            for span in line.get('spans', [])
+        )
+        if STAIR_DETAIL_RE.search(text):
+            bx0, by0, bx1, by1 = block['bbox']
+            # Zone: extends 800px above the detail title, ± 300px wide
+            zones.append(fitz.Rect(
+                max(0,  bx0 - 300),
+                max(0,  by1 - 800),
+                min(pw, bx1 + 300),
+                by1 + 10
+            ))
+    return zones
+
+
+def in_detail_zone(cx, cy, zones):
+    pt = fitz.Point(cx, cy)
+    return any(z.contains(pt) for z in zones)
 
 
 def sort_by_columns_right_to_left(instances, gap_fraction=0.04):
@@ -860,10 +910,16 @@ def process():
                 file_is_dock[filename] = dock
                 # Classify: DOCK (mixed view), LIFT (side-by-side elevations),
                 # or standard PLAN/ELEVATION/SECTION/UNKNOWN
+                stair = (not dock) and (not lift) and is_staircore_drawing(filename, page_texts)
                 if dock:
                     draw_type = 'DOCK'
                 elif lift:
                     draw_type = 'LIFT'
+                elif stair:
+                    # Staircore PLAN drawings use normal PLAN handling;
+                    # section/elevation drawings use STAIRCORE type.
+                    raw_type  = detect_drawing_type(filename, pages)
+                    draw_type = 'PLAN' if raw_type == 'PLAN' else 'STAIRCORE'
                 else:
                     draw_type = detect_drawing_type(filename, pages)
                 file_draw_types[filename] = draw_type
@@ -873,13 +929,18 @@ def process():
                 for page_idx, page in enumerate(pages):
                     file_page_dims[filename] = (page.rect.width, page.rect.height)
                     elevations    = extract_elevations(page)
-                    # For dock drawings, detect which y-bands are PLAN vs ELEVATION
-                    view_sections = get_dock_view_sections(page) if dock else None
+                    view_sections   = get_dock_view_sections(page) if dock else None
+                    detail_zones    = get_staircore_detail_zones(page) if draw_type == 'STAIRCORE' else []
                     for ref in all_searched:
                         for inst in page.search_for(ref):
                             cx = (inst.x0 + inst.x1) / 2
                             cy = (inst.y0 + inst.y1) / 2
-                            sec_type = section_type_at(cy, view_sections) if dock else None
+                            if dock:
+                                sec_type = section_type_at(cy, view_sections)
+                            elif draw_type == 'STAIRCORE':
+                                sec_type = 'DETAIL' if in_detail_zone(cx, cy, detail_zones) else 'MAIN_SECTION'
+                            else:
+                                sec_type = None
                             all_candidates[ref].append({
                                 'ref':        ref,
                                 'filename':   filename,
@@ -968,8 +1029,9 @@ def process():
                 continue
 
             # Separate instances by project/drawing type
-            lift_insts = [i for i in instances if i['draw_type'] == 'LIFT']
-            dock_insts = [i for i in instances if i['draw_type'] == 'DOCK']
+            lift_insts      = [i for i in instances if i['draw_type'] == 'LIFT']
+            dock_insts      = [i for i in instances if i['draw_type'] == 'DOCK']
+            staircore_insts = [i for i in instances if i['draw_type'] == 'STAIRCORE']
             elev_insts = [i for i in instances if i['draw_type'] in ('ELEVATION', 'SECTION')]
             plan_insts = [i for i in instances if i['draw_type'] in ('PLAN', 'UNKNOWN')]
 
@@ -993,6 +1055,39 @@ def process():
                         f"{len(lift_insts)-hl} outlined"
                     )
                 selected_instances.extend(lift_insts)
+
+            # ---- STAIRCORE / STAIR SHAFT SECTION DRAWINGS ---------------
+            # One large main section shows all floors; detail sections show
+            # individual floor transitions at larger scale.
+            # MAIN_SECTION instances: quota applied bottom-up.
+            # DETAIL instances: outline only — they duplicate main section info.
+            # Staircore PLAN drawings (separate files) use the PLAN branch.
+            staircore_insts = [i for i in instances if i['draw_type'] == 'STAIRCORE']
+            if staircore_insts:
+                main_insts   = [i for i in staircore_insts if i.get('sec_type') != 'DETAIL']
+                detail_insts = [i for i in staircore_insts if i.get('sec_type') == 'DETAIL']
+
+                for inst in detail_insts:
+                    inst['ann_type'] = 'outline'
+
+                # Main section: sort bottom-up (ground floor first)
+                main_insts.sort(key=lambda i: (i['page_idx'], -i['cy']))
+                hl = 0
+                for inst in main_insts:
+                    if hl < q:
+                        inst['ann_type'] = 'highlight'
+                        hl += 1
+                    else:
+                        inst['ann_type'] = 'outline'
+
+                logs.append(
+                    f"  -> '{ref}': staircore section "
+                    f"[main: {hl} highlighted bottom-up, "
+                    f"{len(main_insts)-hl} outlined | "
+                    f"detail zones: {len(detail_insts)} outline-only]"
+                )
+                selected_instances.extend(main_insts)
+                selected_instances.extend(detail_insts)
 
             # ---- DOCK DRAWINGS ------------------------------------------
             # Each dock sheet has elevation (top) and plan (bottom) stacked.
