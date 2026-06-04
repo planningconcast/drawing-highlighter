@@ -509,41 +509,58 @@ def build_sheet_pairs(saved_paths, file_draw_types, file_docs):
     return pairs
 
 
-def apply_boundary_strip(plan_insts, sheet_pairs, logs):
+def apply_boundary_strip(plan_insts, sheet_pairs, logs, dock_mode=False):
     """
-    For each sheet pair, mark instances on sheet B (the right-hand sheet) whose
-    text label falls inside the boundary strip as outline-only.
+    Handle instances near the shared gridline between paired drawings.
 
-    The strip is centred on the detected split gridline x on sheet B.
-    Sheet A is untouched — it owns the boundary.
+    BUILDING mode (dock_mode=False):
+      Sheet A owns the boundary. Sheet B instances in the strip -> outline.
 
-    Since docs are closed by this point, we use the instance cx values
-    (collected during the scan pass) to check strip membership.
+    DOCK mode (dock_mode=True):
+      Both sheets show the boundary unit highlighted — erectors need to see
+      the unit in context on both adjacent drawings.
+      Boundary instances are tagged 'boundary' so the quota loop skips them
+      (they never consume from the quota pool).
     """
     if not sheet_pairs:
         return plan_insts
 
-    # Build lookup: fn_b -> (gridline_x_b, strip_width)
-    b_strips = {}
+    # Build lookup: filename -> list of (gridline_x, strip_width, is_a_side)
+    strips = defaultdict(list)
     for pair in sheet_pairs:
-        b_strips[pair["fn_b"]] = (pair["gridline_x_b"], pair["strip_width"])
+        strips[pair['fn_a']].append((pair['gridline_x_a'], pair['strip_width'], True))
+        strips[pair['fn_b']].append((pair['gridline_x_b'], pair['strip_width'], False))
 
-    marked = 0
+    marked_outline = 0
+    marked_boundary = 0
+
     for inst in plan_insts:
-        fn = inst["filename"]
-        if fn not in b_strips:
+        fn = inst['filename']
+        if fn not in strips:
             continue
-        gx_b, sw = b_strips[fn]
-        # Check if this instance's text position is inside the boundary strip
-        if abs(inst["cx"] - gx_b) <= sw:
-            if inst["ann_type"] != "outline":   # don't double-mark
-                inst["ann_type"] = "outline"
-                marked += 1
+        for gx, sw, is_a in strips[fn]:
+            if abs(inst['cx'] - gx) > sw:
+                continue
+            if dock_mode:
+                # Both sides: highlight freely, flag as boundary to skip quota
+                inst['is_boundary'] = True
+                inst['ann_type']    = 'highlight'
+                marked_boundary += 1
+            else:
+                # Building mode: only sheet B gets outline
+                if not is_a and inst['ann_type'] != 'outline':
+                    inst['ann_type'] = 'outline'
+                    marked_outline += 1
+            break
 
-    if marked > 0:
+    if marked_outline > 0:
         logs.append(
-            f"  ↳ Boundary strip: {marked} instance(s) on sheet-2 side "
-            f"→ outline-only (sheet 1 owns the gridline)"
+            f"  Boundary strip: {marked_outline} sheet-B instance(s) -> outline"
+        )
+    if marked_boundary > 0:
+        logs.append(
+            f"  Dock boundary: {marked_boundary} instance(s) at shared gridline "
+            f"-> highlighted on both drawings (quota-exempt)"
         )
     return plan_insts
 
@@ -885,7 +902,7 @@ def process():
                         inst['ann_type'] = 'outline'
 
                     # Apply boundary strip and quota to plan instances
-                    dock_plan_raw = apply_boundary_strip(dock_plan_raw, sheet_pairs, logs)
+                    dock_plan_raw = apply_boundary_strip(dock_plan_raw, sheet_pairs, logs, dock_mode=True)
 
                     def dock_plan_key(i):
                         centroid = file_heat_centroids.get(i['filename'])
@@ -893,10 +910,12 @@ def process():
 
                     dock_plan_raw.sort(key=dock_plan_key)
 
+                    # Quota applies only to non-boundary instances
                     hl = 0
+                    boundary_hl = sum(1 for i in dock_plan_raw if i.get('is_boundary'))
                     for inst in dock_plan_raw:
-                        if inst['ann_type'] == 'outline':
-                            continue
+                        if inst.get('is_boundary') or inst['ann_type'] == 'outline':
+                            continue  # boundary = quota-exempt; outline = already set
                         if hl < q:
                             inst['ann_type'] = 'highlight'
                             hl += 1
@@ -905,7 +924,8 @@ def process():
 
                     logs.append(
                         f"  -> '{ref}': plan-priority dock "
-                        f"[plan: {hl} highlighted, {len(dock_plan_raw)-hl} outlined | "
+                        f"[plan: {hl} highlighted + {boundary_hl} boundary (quota-exempt), "
+                        f"{len(dock_plan_raw)-hl-boundary_hl} outlined | "
                         f"elev: {len(dock_elev_raw)} outline-only]"
                     )
                     selected_instances.extend(dock_plan_raw)
@@ -915,10 +935,11 @@ def process():
                     # Ref appears ONLY in elevation (e.g. mullion, header panel)
                     # Treat elevation as primary — apply quota bottom-up
                     dock_elev_raw.sort(key=lambda i: (i['page_idx'], -i['cy']))
-                    dock_elev_raw = apply_boundary_strip(dock_elev_raw, sheet_pairs, logs)
+                    dock_elev_raw = apply_boundary_strip(dock_elev_raw, sheet_pairs, logs, dock_mode=True)
                     hl = 0
+                    boundary_hl = sum(1 for i in dock_elev_raw if i.get('is_boundary'))
                     for inst in dock_elev_raw:
-                        if inst['ann_type'] == 'outline':
+                        if inst.get('is_boundary') or inst['ann_type'] == 'outline':
                             continue
                         if hl < q:
                             inst['ann_type'] = 'highlight'
@@ -927,7 +948,8 @@ def process():
                             inst['ann_type'] = 'outline'
                     logs.append(
                         f"  -> '{ref}': elevation-only dock "
-                        f"[{hl} highlighted bottom-up, {len(dock_elev_raw)-hl} outlined]"
+                        f"[{hl} highlighted + {boundary_hl} boundary (quota-exempt), "
+                        f"{len(dock_elev_raw)-hl-boundary_hl} outlined]"
                     )
                     selected_instances.extend(dock_elev_raw)
 
