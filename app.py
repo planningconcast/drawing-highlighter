@@ -13,6 +13,18 @@ from werkzeug.utils import secure_filename
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024
 
+# ---------------------------------------------------------------------------
+APP_VERSION = '1.6.0'
+APP_BUILD   = '2025-06-04'
+APP_NOTES   = (
+    'Multi-priority PDF annotation & audit | '
+    'Building (multi-storey), Dock, Lift/Stair/Shaft project types | '
+    'Split-sheet deduplication | '
+    'Elevation-only unit fallback | '
+    'Quota-exempt boundary zones'
+)
+# ---------------------------------------------------------------------------
+
 # ===========================================================================
 # ELEVATION MARKER EXTRACTION
 # ===========================================================================
@@ -569,6 +581,67 @@ def deduplicate_sheet_overlaps(plan_insts, sheet_pairs, logs):
     """Legacy stub — boundary strip logic replaced this function."""
     return plan_insts
 # ===========================================================================
+# LIFT / STAIR / SHAFT DRAWINGS
+#
+# These drawings show multiple elevation views SIDE BY SIDE horizontally
+# (e.g. Elevation 01, 02, 03 on one sheet).  Units repeat across faces.
+# Strategy: identify vertical columns by x-gaps, fill right column first
+# (bottom-to-top within each column), then move left.
+# ===========================================================================
+LIFT_RE = re.compile(
+    r'\b(LIFT|SHAFT|LIFT[_\s]CORE|LIFT[_\s]SHAFT|STAIR|STAIRCASE|STAIR[_\s]CORE)\b',
+    re.IGNORECASE
+)
+
+
+def is_lift_drawing(filename, page_texts):
+    combined = re.sub(r'[-_.]', ' ', filename.upper())
+    for pt in page_texts[:2]:
+        combined += ' ' + pt[:2000].upper()
+    return bool(LIFT_RE.search(combined))
+
+
+def sort_by_columns_right_to_left(instances, gap_fraction=0.04):
+    """
+    Group instances into vertical columns by detecting x-gaps in their
+    cx distribution.  Returns instances sorted:
+      1. Column order: rightmost column first
+      2. Within each column: bottom-to-top (largest cy first, since
+         y=0 is top of page in PDF space)
+
+    gap_fraction: minimum gap between adjacent instance cx values
+    (as a fraction of total x-range) to be considered a new column.
+    """
+    if len(instances) <= 1:
+        return instances[:]
+
+    sorted_x = sorted(instances, key=lambda i: i['cx'])
+    xs       = [i['cx'] for i in sorted_x]
+    x_range  = xs[-1] - xs[0]
+    if x_range == 0:
+        return sorted(instances, key=lambda i: -i['cy'])
+
+    gap_min = x_range * gap_fraction
+
+    # Build columns by splitting at gaps
+    columns      = []
+    current_col  = [sorted_x[0]]
+    for k in range(1, len(sorted_x)):
+        if xs[k] - xs[k-1] > gap_min:
+            columns.append(current_col)
+            current_col = []
+        current_col.append(sorted_x[k])
+    columns.append(current_col)
+
+    # Right column first; within each column sort bottom-to-top
+    result = []
+    for col in reversed(columns):        # reversed = rightmost first
+        col_sorted = sorted(col, key=lambda i: -i['cy'])  # largest cy = bottom
+        result.extend(col_sorted)
+    return result
+
+
+# ===========================================================================
 # INPUT PARSERS
 # ===========================================================================
 def parse_count_list(raw):
@@ -671,11 +744,22 @@ def tier_colour(tier):
 # ===========================================================================
 @app.route('/health')
 def health():
-    return 'ok', 200
+    return f'ok | v{APP_VERSION} ({APP_BUILD})', 200
+
+
+@app.route('/version')
+def version():
+    return {
+        'version': APP_VERSION,
+        'build':   APP_BUILD,
+        'notes':   APP_NOTES,
+    }
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    return render_template('index.html',
+                           app_version=APP_VERSION,
+                           app_build=APP_BUILD)
 
 @app.route('/process', methods=['POST'])
 def process():
@@ -772,9 +856,16 @@ def process():
                 pages = [doc[i] for i in range(len(doc))]
                 page_texts = [p.get_text('text') for p in pages]
                 dock        = is_dock_project(filename, page_texts)
+                lift        = (not dock) and is_lift_drawing(filename, page_texts)
                 file_is_dock[filename] = dock
-                # For dock drawings, classify as DOCK (mixed view) not PLAN/ELEV
-                draw_type = 'DOCK' if dock else detect_drawing_type(filename, pages)
+                # Classify: DOCK (mixed view), LIFT (side-by-side elevations),
+                # or standard PLAN/ELEVATION/SECTION/UNKNOWN
+                if dock:
+                    draw_type = 'DOCK'
+                elif lift:
+                    draw_type = 'LIFT'
+                else:
+                    draw_type = detect_drawing_type(filename, pages)
                 file_draw_types[filename] = draw_type
                 floor_lvl = extract_floor_level(filename)
                 logs.append(f"Scanning: {filename} [{draw_type}, floor {floor_lvl}]")
@@ -876,10 +967,32 @@ def process():
             if not instances:
                 continue
 
-            # Separate dock instances from traditional building instances
+            # Separate instances by project/drawing type
+            lift_insts = [i for i in instances if i['draw_type'] == 'LIFT']
             dock_insts = [i for i in instances if i['draw_type'] == 'DOCK']
             elev_insts = [i for i in instances if i['draw_type'] in ('ELEVATION', 'SECTION')]
             plan_insts = [i for i in instances if i['draw_type'] in ('PLAN', 'UNKNOWN')]
+
+            # ---- LIFT / STAIR / SHAFT DRAWINGS --------------------------
+            # Multiple elevation views arranged side-by-side horizontally.
+            # Fill rightmost column first (bottom-to-top), then move left.
+            # Quota applied across all columns combined.
+            if lift_insts:
+                lift_insts = sort_by_columns_right_to_left(lift_insts)
+                hl = 0
+                for inst in lift_insts:
+                    if hl < q:
+                        inst['ann_type'] = 'highlight'
+                        hl += 1
+                    else:
+                        inst['ann_type'] = 'outline'
+                if len(lift_insts) > q or hl < q:
+                    logs.append(
+                        f"  -> '{ref}': lift/shaft [{len(lift_insts)} instances across "
+                        f"all elevation faces] {hl} highlighted right-to-left, "
+                        f"{len(lift_insts)-hl} outlined"
+                    )
+                selected_instances.extend(lift_insts)
 
             # ---- DOCK DRAWINGS ------------------------------------------
             # Each dock sheet has elevation (top) and plan (bottom) stacked.
