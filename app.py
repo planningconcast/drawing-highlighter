@@ -115,23 +115,165 @@ def extract_title_block_text(page):
                 parts.append(span["text"])
     return " ".join(parts)
 
+# ---------------------------------------------------------------------------
+# FONT-SIZE-RANKED TITLE DETECTION & VIEWPORT FRAME HARVESTING
+# ---------------------------------------------------------------------------
+
+def get_large_text_spans(page):
+    """
+    Return all text spans sorted by font size descending, filtered to those
+    with meaningful alphabetic content (excludes pure dimension numbers).
+    View titles are almost always the largest text on the page.
+    """
+    spans = []
+    for block in page.get_text('dict')['blocks']:
+        if block.get('type') != 0:
+            continue
+        for line in block.get('lines', []):
+            for span in line.get('spans', []):
+                text = span['text'].strip()
+                # Must contain letters and be at least 4 chars
+                if text and len(text) >= 4 and any(c.isalpha() for c in text):
+                    spans.append({
+                        'text': text,
+                        'size': span['size'],
+                        'bbox': span['bbox'],
+                        'cx':   (span['bbox'][0] + span['bbox'][2]) / 2,
+                        'cy':   (span['bbox'][1] + span['bbox'][3]) / 2,
+                    })
+    spans.sort(key=lambda s: -s['size'])
+    return spans
+
+
+def detect_viewport_frames(page, min_frac=0.03, max_frac=0.92):
+    """
+    Harvest large rectangular closed paths from CAD vector content.
+    AutoCAD and Tekla output viewport bounding boxes as distinct rectangles.
+    Returns list of fitz.Rect sorted by area descending.
+    """
+    pw, ph    = page.rect.width, page.rect.height
+    page_area = pw * ph
+    frames    = []
+    try:
+        for path in page.get_drawings():
+            r = path.get('rect')
+            if r is None:
+                continue
+            frac = (r.width * r.height) / page_area
+            if (min_frac <= frac <= max_frac
+                    and r.width  > pw * 0.08
+                    and r.height > ph * 0.08):
+                frames.append(r)
+    except Exception:
+        pass
+    frames.sort(key=lambda r: -(r.width * r.height))
+    return frames
+
+
+def find_view_titles(page):
+    """
+    Identify view title spans by combining font-size ranking with keyword matching.
+
+    Strategy:
+      1. Collect all meaningful alphabetic spans ranked by font size.
+      2. Take spans in the top 25% by size — these are headings/titles.
+      3. Among those, keep only spans matching view-type keywords.
+      4. Deduplicate nearby titles (CAD sometimes repeats a title string).
+
+    Returns list of {'text', 'size', 'cx', 'cy', 'type', 'bbox'}
+    sorted top-to-bottom (ascending cy).
+    """
+    all_spans = get_large_text_spans(page)
+    if not all_spans:
+        return []
+
+    sizes    = sorted({s['size'] for s in all_spans}, reverse=True)
+    cutoff   = sizes[max(0, int(len(sizes) * 0.25) - 1)]
+    cands    = [s for s in all_spans if s['size'] >= cutoff]
+
+    # Priority-ordered keyword table (first match wins)
+    VIEW_KWS = [
+        ('DETAIL',               'DETAIL'),
+        ('DOCK FOUNDATION PLAN', 'PLAN'),
+        ('DOCK SLAB PLAN',       'PLAN'),
+        ('YARD WALL PLAN',       'PLAN'),
+        ('WING WALL',            'PLAN'),
+        ('HUB PLAN',             'PLAN'),
+        ('FLOOR PLAN',           'PLAN'),
+        ('PLAN',                 'PLAN'),
+        ('DOCK ELEVATION',       'ELEVATION'),
+        ('WING WALLS ELEVATION', 'ELEVATION'),
+        ('YARD WALL ELEVATION',  'ELEVATION'),
+        ('HUB ELEVATION',        'ELEVATION'),
+        ('ELEVATION',            'ELEVATION'),
+        ('SECTION',              'SECTION'),
+    ]
+
+    titles = []
+    for span in cands:
+        tu = span['text'].upper()
+        matched = None
+        for kw, vtype in VIEW_KWS:
+            if kw in tu:
+                matched = vtype
+                break
+        if matched is None:
+            continue
+        titles.append({**span, 'type': matched})
+
+    # Deduplicate: merge spans within 60px vertically / 250px horizontally
+    merged = []
+    for t in sorted(titles, key=lambda x: x['cy']):
+        close = [m for m in merged
+                 if abs(m['cy'] - t['cy']) < 60
+                 and abs(m['cx'] - t['cx']) < 250]
+        if close:
+            if t['size'] > close[0]['size']:
+                merged.remove(close[0])
+                merged.append(t)
+        else:
+            merged.append(t)
+
+    return sorted(merged, key=lambda t: t['cy'])
+
+
 def detect_drawing_type(filename, pages):
+    """
+    Detect drawing type in priority order:
+      1. Filename keywords (fastest, most reliable for well-named files)
+      2. Font-size-ranked title spans (largest text = view titles)
+      3. Title block zone (bottom-right 40x25% coordinate region)
+      4. Full page text fallback
+    """
     name = re.sub(r'[-_.()[\]]', ' ',
                   os.path.splitext(os.path.basename(filename))[0]).upper()
     if SECT_RE.search(name): return 'SECTION'
     if ELEV_RE.search(name): return 'ELEVATION'
     if PLAN_RE.search(name): return 'PLAN'
+
+    # Font-size-ranked: view titles are the largest alphabetic text on the page
+    for page in pages:
+        for title in find_view_titles(page)[:6]:
+            tu = title['text'].upper()
+            if SECT_RE.search(tu): return 'SECTION'
+            if ELEV_RE.search(tu): return 'ELEVATION'
+            if PLAN_RE.search(tu): return 'PLAN'
+
+    # Title block zone (coordinate-based)
     for page in pages:
         tb = extract_title_block_text(page).upper()
         if SECT_RE.search(tb): return 'SECTION'
         if ELEV_RE.search(tb): return 'ELEVATION'
         if PLAN_RE.search(tb): return 'PLAN'
+
+    # Full page text fallback
     for page in pages:
-        full = page.get_text("text").upper()
+        full = page.get_text('text').upper()
         if SECT_RE.search(full): return 'SECTION'
         if ELEV_RE.search(full): return 'ELEVATION'
         if PLAN_RE.search(full): return 'PLAN'
-    return 'UNKNOWN'
+
+    return 'UNKNOWN' 
 
 
 # ===========================================================================
@@ -155,19 +297,31 @@ ELEV_TITLE_RE = re.compile(
 DOCK_BAY_RE = re.compile(r'GL\s+([A-Z]+)/(\d+)-(\d+)', re.IGNORECASE)
 
 
-def is_dock_project(filename, page_texts):
-    combined = re.sub(r'[-_.]', ' ', filename.upper())
-    for pt in page_texts[:2]:
-        combined += ' ' + pt[:2000].upper()
-    return bool(DOCK_RE.search(combined))
-
-
 def get_dock_view_sections(page):
+    """
+    Detect view boundaries on dock/yard-wall drawings.
+    Uses font-size-ranked title detection first (more robust than keyword-only).
+    Falls back to PLAN_TITLE_RE / ELEV_TITLE_RE keyword matching if font-size
+    approach finds no titles (e.g. very uniform font-size drawings).
+    """
+    # --- Primary: font-size-ranked titles ---
+    view_titles = find_view_titles(page)
+    plan_elev   = [t for t in view_titles if t['type'] in ('PLAN', 'ELEVATION')]
+
+    if plan_elev:
+        sections = []
+        y_start  = 0.0
+        for t in plan_elev:   # already sorted top-to-bottom by cy
+            sections.append({'type': t['type'], 'y_min': y_start, 'y_max': t['cy']})
+            y_start = t['cy']
+        return sections
+
+    # --- Fallback: keyword block matching ---
     titles = []
     for block in page.get_text('dict')['blocks']:
         if block.get('type') != 0:
             continue
-        text = ' '.join(
+        text  = ' '.join(
             span['text']
             for line in block.get('lines', [])
             for span in line.get('spans', [])
@@ -181,7 +335,7 @@ def get_dock_view_sections(page):
         return None
     titles.sort(key=lambda t: t[1])
     sections = []
-    y_start = 0.0
+    y_start  = 0.0
     for kind, y_bot in titles:
         sections.append({'type': kind, 'y_min': y_start, 'y_max': y_bot})
         y_start = y_bot
@@ -594,61 +748,11 @@ LIFT_RE = re.compile(
 )
 
 
-def is_lift_drawing(filename, page_texts):
-    combined = re.sub(r'[-_.]', ' ', filename.upper())
-    for pt in page_texts[:2]:
-        combined += ' ' + pt[:2000].upper()
-    return bool(LIFT_RE.search(combined))
-
-
-
 STAIRCORE_RE = re.compile(
     r'\b(STAIRCORE|STAIR[\s_-]+CORE|STAIR[\s_-]+SHAFT|STAIR[\s_-]+FLIGHT|STAIRCASE)\b',
     re.IGNORECASE
 )
 STAIR_DETAIL_RE = re.compile(r'\bDETAIL\b', re.IGNORECASE)
-
-
-def is_staircore_drawing(filename, page_texts):
-    combined = re.sub(r'[-_.]', ' ', filename.upper())
-    for pt in page_texts[:2]:
-        combined += ' ' + pt[:2000].upper()
-    return bool(STAIRCORE_RE.search(combined))
-
-
-def get_staircore_detail_zones(page):
-    """
-    Find bounding zones of DETAIL views on a staircore section drawing.
-    Detail titles (e.g. 'Detail Section P1') sit below their view.
-    Each zone extends 800px upward from the title block — instances
-    inside a zone are in a detail view and should be outlined only.
-    Returns list of fitz.Rect zones.
-    """
-    pw, ph = page.rect.width, page.rect.height
-    zones  = []
-    for block in page.get_text('dict')['blocks']:
-        if block.get('type') != 0:
-            continue
-        text = ' '.join(
-            span['text']
-            for line in block.get('lines', [])
-            for span in line.get('spans', [])
-        )
-        if STAIR_DETAIL_RE.search(text):
-            bx0, by0, bx1, by1 = block['bbox']
-            # Zone: extends 800px above the detail title, ± 300px wide
-            zones.append(fitz.Rect(
-                max(0,  bx0 - 300),
-                max(0,  by1 - 800),
-                min(pw, bx1 + 300),
-                by1 + 10
-            ))
-    return zones
-
-
-def in_detail_zone(cx, cy, zones):
-    pt = fitz.Point(cx, cy)
-    return any(z.contains(pt) for z in zones)
 
 
 def sort_by_columns_right_to_left(instances, gap_fraction=0.04):
@@ -897,334 +1001,271 @@ def process():
             upload.save(in_path)
             saved_paths.append((filename, in_path))
 
-        file_docs    = {}  # keep docs open for sheet-pair gridline detection
-        file_is_dock = {}  # filename -> bool
+        file_docs = {}   # keep open for stitch-line gridline detection
 
         for filename, in_path in saved_paths:
             try:
-                doc   = fitz.open(in_path)
-                pages = [doc[i] for i in range(len(doc))]
+                doc        = fitz.open(in_path)
+                pages      = [doc[i] for i in range(len(doc))]
                 page_texts = [p.get_text('text') for p in pages]
-                dock        = is_dock_project(filename, page_texts)
-                lift        = (not dock) and is_lift_drawing(filename, page_texts)
-                file_is_dock[filename] = dock
-                # Classify: DOCK (mixed view), LIFT (side-by-side elevations),
-                # or standard PLAN/ELEVATION/SECTION/UNKNOWN
-                stair = (not dock) and (not lift) and is_staircore_drawing(filename, page_texts)
-                if dock:
-                    draw_type = 'DOCK'
-                elif lift:
-                    draw_type = 'LIFT'
-                elif stair:
-                    # Staircore PLAN drawings use normal PLAN handling;
-                    # section/elevation drawings use STAIRCORE type.
-                    raw_type  = detect_drawing_type(filename, pages)
-                    draw_type = 'PLAN' if raw_type == 'PLAN' else 'STAIRCORE'
-                else:
-                    draw_type = detect_drawing_type(filename, pages)
-                file_draw_types[filename] = draw_type
+
+                # File-level draw type is a fallback hint only.
+                # Per-instance view type is derived from page layout below.
+                file_draw_type = detect_drawing_type(filename, pages)
+                file_draw_types[filename] = file_draw_type
                 floor_lvl = extract_floor_level(filename)
-                logs.append(f"Scanning: {filename} [{draw_type}, floor {floor_lvl}]")
+                logs.append(f"Scanning: {filename} [{file_draw_type}, floor {floor_lvl}]")
 
                 for page_idx, page in enumerate(pages):
-                    file_page_dims[filename] = (page.rect.width, page.rect.height)
-                    elevations    = extract_elevations(page)
-                    view_sections   = get_dock_view_sections(page) if dock else None
-                    detail_zones    = get_staircore_detail_zones(page) if draw_type == 'STAIRCORE' else []
+                    pw, ph = page.rect.width, page.rect.height
+                    file_page_dims[filename] = (pw, ph)
+                    elevations  = extract_elevations(page)
+
+                    # ── VIEW LAYOUT ANALYSIS ─────────────────────────────
+                    # Run on every drawing regardless of project type.
+                    # Font-size-ranked titles + CAD viewport frames give us
+                    # the view-type of each area of the page.
+                    view_titles = find_view_titles(page)
+                    frames      = detect_viewport_frames(page)
+
+                    # Build vertical section bands from title positions.
+                    # Each title sits at the bottom of its view section.
+                    page_sections = None
+                    if view_titles:
+                        secs    = []
+                        y_start = 0.0
+                        for t in view_titles:
+                            secs.append({
+                                'type':  t['type'],
+                                'y_min': y_start,
+                                'y_max': t['cy'],
+                            })
+                            y_start = t['cy']
+                        page_sections = secs
+
+                    def instance_view_type(cx, cy):
+                        """
+                        Determine the view type (PLAN/ELEVATION/SECTION/DETAIL)
+                        for an instance at (cx, cy).  Priority:
+                          1. Vertical section band from font-size title positions
+                          2. Viewport frame containment + nearest title (side-by-side views)
+                          3. File-level draw_type fallback
+                        """
+                        if page_sections:
+                            vt = section_type_at(cy, page_sections)
+                            if vt in ('PLAN', 'ELEVATION', 'SECTION', 'DETAIL'):
+                                return vt
+                        pt = fitz.Point(cx, cy)
+                        for frame in frames:
+                            if frame.contains(pt) and view_titles:
+                                nearest = min(
+                                    view_titles,
+                                    key=lambda t: abs(t['cy'] - frame.y1)
+                                )
+                                return nearest['type']
+                        if file_draw_type in ('ELEVATION', 'SECTION'):
+                            return 'ELEVATION'
+                        if file_draw_type == 'PLAN':
+                            return 'PLAN'
+                        return 'PLAN'
+
                     for ref in all_searched:
                         for inst in page.search_for(ref):
                             cx = (inst.x0 + inst.x1) / 2
                             cy = (inst.y0 + inst.y1) / 2
-                            if dock:
-                                sec_type = section_type_at(cy, view_sections)
-                            elif draw_type == 'STAIRCORE':
-                                sec_type = 'DETAIL' if in_detail_zone(cx, cy, detail_zones) else 'MAIN_SECTION'
-                            else:
-                                sec_type = None
+                            vtype = instance_view_type(cx, cy)
                             all_candidates[ref].append({
-                                'ref':        ref,
-                                'filename':   filename,
-                                'in_path':    in_path,
-                                'page_idx':   page_idx,
-                                'rect':       inst,
-                                'elevation':  elevation_for_rect(inst, elevations),
+                                'ref':       ref,
+                                'filename':  filename,
+                                'in_path':   in_path,
+                                'page_idx':  page_idx,
+                                'rect':      inst,
+                                'elevation': elevation_for_rect(inst, elevations),
                                 'cx': cx, 'cy': cy,
-                                'draw_type':  draw_type,
-                                'floor_lvl':  floor_lvl,
-                                'sec_type':   sec_type,   # 'PLAN'|'ELEVATION'|None
-                                'load_no':    None,
-                                'ann_type':   'highlight',
+                                'page_w': pw, 'page_h': ph,
+                                'draw_type': file_draw_type,
+                                'floor_lvl': floor_lvl,
+                                'sec_type':  vtype,
+                                'load_no':   None,
+                                'ann_type':  'highlight',
                             })
-                            # Only count plan-zone instances toward heat map
-                            if sec_type != 'ELEVATION':
+                            if vtype in ('PLAN', None) or (
+                                    vtype is None and file_draw_type == 'PLAN'):
                                 all_unit_pos_by_file[filename].append((cx, cy))
+
                 file_docs[filename] = doc
             except Exception as e:
                 logs.append(f"ERROR scanning {filename}: {e}")
 
-        # Compute heat centroids for plan and dock drawings
+        # Heat centroids — any file with plan-zone instances
         for filename, in_path in saved_paths:
-            if file_draw_types.get(filename) in ('PLAN', 'DOCK'):
-                try:
-                    pw, ph = file_page_dims.get(filename, (1000, 1000))
-                    positions = all_unit_pos_by_file[filename]
-                    centroid  = compute_heat_centroid(positions, pw, ph)
-                    file_heat_centroids[filename] = centroid
-                    if centroid:
-                        logs.append(f"  ↳ {filename}: heat area at ({centroid[0]:.0f}, {centroid[1]:.0f})")
-                    else:
-                        logs.append(f"  ↳ {filename}: no heat area — proximity grouping")
-                except Exception:
-                    file_heat_centroids[filename] = None
-
-        # Build split-sheet pairs — multi-storey (1 of 2) and dock (bay ranges)
-        sheet_pairs  = build_sheet_pairs(saved_paths, file_draw_types, file_docs)
-        dock_pairs   = build_dock_sheet_pairs(saved_paths, file_draw_types, file_docs)
-        sheet_pairs += dock_pairs
-        if dock_pairs:
-            for p in dock_pairs:
-                logs.append(
-                    f"  ↳ Dock bay pair [{p['method']}]: "
-                    f"{os.path.basename(p['fn_a'])} <-> {os.path.basename(p['fn_b'])} "
-                    f"| boundary x: A={p['gridline_x_a']:.0f}, B={p['gridline_x_b']:.0f}"
-                )
-        if sheet_pairs:
-            for p in sheet_pairs:
-                logs.append(
-                    f"  ↳ Split-sheet pair [{p['method']}]: "
-                    f"{os.path.basename(p['fn_a'])} ↔ {os.path.basename(p['fn_b'])} "
-                    f"| gridline x: sheet1={p['gridline_x_a']:.0f}, "
-                    f"sheet2={p['gridline_x_b']:.0f}, strip±{p['strip_width']:.0f}"
-                )
-
-        # Close docs after pair detection — no longer needed until annotation pass
-        for doc in file_docs.values():
+            positions = all_unit_pos_by_file.get(filename, [])
+            if not positions:
+                continue
             try:
-                doc.close()
+                pw, ph   = file_page_dims.get(filename, (1000, 1000))
+                centroid = compute_heat_centroid(positions, pw, ph)
+                file_heat_centroids[filename] = centroid
+                if centroid:
+                    logs.append(
+                        f"  {filename}: heat area ({centroid[0]:.0f}, {centroid[1]:.0f})")
+                else:
+                    logs.append(f"  {filename}: no heat area — proximity grouping")
             except Exception:
-                pass
+                file_heat_centroids[filename] = None
+
+        # Stitch-line detection (file continuity — not project-type specific)
+        sheet_pairs = build_sheet_pairs(saved_paths, file_draw_types, file_docs)
+        bay_pairs   = build_dock_sheet_pairs(saved_paths, file_draw_types, file_docs)
+        sheet_pairs += bay_pairs
+        for p in sheet_pairs:
+            logs.append(
+                f"  Stitch [{p['method']}]: "
+                f"{os.path.basename(p['fn_a'])} <-> {os.path.basename(p['fn_b'])} "
+                f"boundary x: A={p['gridline_x_a']:.0f} B={p['gridline_x_b']:.0f}"
+            )
+
+        for doc in file_docs.values():
+            try: doc.close()
+            except Exception: pass
         file_docs = {}
 
         # ===================================================================
-        # PHASE 2: QUOTA SELECTION
+        # PHASE 2 — UNIFIED QUOTA SELECTION
         #
-        # PLAN / UNKNOWN:
-        #   - Deduplicate overlapping split-sheet instances
-        #   - Sort by floor level ascending (lowest = built first)
-        #   - Within same floor, sort by heat centroid distance
-        #   - First quota(ref) instances → highlight
-        #   - Remaining spotted instances → outline rectangle
+        # sec_type (per-instance, from layout analysis) is the sole driver.
+        # Project type is not consulted.
         #
-        # ELEVATION / SECTION:
-        #   - Global quota across ALL elevation drawings
-        #   - Sort bottom-up (largest cy first = ground level)
-        #   - First quota(ref) instances → highlight
-        #   - Remaining → outline rectangle
+        # DETAIL        → outline only, no quota consumed
+        # PLAN          → quota A  (floor level asc, heat centroid dist)
+        # ELEV / SECTION→ quota B  (bottom-up, or column-right-to-left when
+        #                           views are horizontally arranged)
+        #
+        # If ref exists in BOTH plan and elev zones:
+        #   plan highlighted (quota A), elev outlined
+        # If ref exists ONLY in elev zones:
+        #   elev highlighted (quota B)
+        #
+        # Stitch-line instances are quota-exempt on both drawings.
         # ===================================================================
-        selected_instances = []  # both highlights and outlines
+        selected_instances = []
+
+        def effective_type(inst):
+            st = inst.get('sec_type')
+            if st in ('PLAN', 'ELEVATION', 'SECTION', 'DETAIL'):
+                return st
+            dt = inst.get('draw_type', 'UNKNOWN')
+            if dt in ('ELEVATION', 'SECTION'): return 'ELEVATION'
+            if dt == 'PLAN':                   return 'PLAN'
+            return 'PLAN'
+
+        def views_are_horizontal(insts):
+            """
+            Detect side-by-side viewport layout (lift core / shaft style).
+            True when x-spread is wide AND y-spread is narrow relative to
+            page dimensions, with at least one detectable x-gap between columns.
+            """
+            if len(insts) < 4:
+                return False
+            xs  = [i['cx'] for i in insts]
+            ys  = [i['cy'] for i in insts]
+            pw  = sum(i.get('page_w', 1000) for i in insts) / len(insts)
+            ph  = sum(i.get('page_h', 1000) for i in insts) / len(insts)
+            xr  = (max(xs) - min(xs)) / pw
+            yr  = (max(ys) - min(ys)) / ph
+            sxs = sorted(xs)
+            xrng = sxs[-1] - sxs[0]
+            gaps = sum(1 for k in range(1, len(sxs))
+                       if sxs[k] - sxs[k-1] > xrng * 0.04)
+            return xr > 0.35 and yr < 0.25 and gaps >= 1
+
+        def run_quota(insts, q, sort_key_fn):
+            """Sort insts, apply quota, return highlight count."""
+            insts.sort(key=sort_key_fn)
+            hl = 0
+            for inst in insts:
+                if inst.get('is_boundary') or inst['ann_type'] == 'outline':
+                    continue
+                if hl < q:
+                    inst['ann_type'] = 'highlight'
+                    hl += 1
+                else:
+                    inst['ann_type'] = 'outline'
+            return hl
 
         for ref, instances in all_candidates.items():
             q = quota(ref)
             if not instances:
                 continue
 
-            # Separate instances by project/drawing type
-            lift_insts      = [i for i in instances if i['draw_type'] == 'LIFT']
-            dock_insts      = [i for i in instances if i['draw_type'] == 'DOCK']
-            staircore_insts = [i for i in instances if i['draw_type'] == 'STAIRCORE']
-            elev_insts = [i for i in instances if i['draw_type'] in ('ELEVATION', 'SECTION')]
-            plan_insts = [i for i in instances if i['draw_type'] in ('PLAN', 'UNKNOWN')]
+            detail_insts = [i for i in instances if effective_type(i) == 'DETAIL']
+            elev_insts   = [i for i in instances
+                            if effective_type(i) in ('ELEVATION', 'SECTION')]
+            plan_insts   = [i for i in instances if effective_type(i) == 'PLAN']
 
-            # ---- LIFT / STAIR / SHAFT DRAWINGS --------------------------
-            # Multiple elevation views arranged side-by-side horizontally.
-            # Fill rightmost column first (bottom-to-top), then move left.
-            # Quota applied across all columns combined.
-            if lift_insts:
-                lift_insts = sort_by_columns_right_to_left(lift_insts)
-                hl = 0
-                for inst in lift_insts:
-                    if hl < q:
-                        inst['ann_type'] = 'highlight'
-                        hl += 1
-                    else:
-                        inst['ann_type'] = 'outline'
-                if len(lift_insts) > q or hl < q:
-                    logs.append(
-                        f"  -> '{ref}': lift/shaft [{len(lift_insts)} instances across "
-                        f"all elevation faces] {hl} highlighted right-to-left, "
-                        f"{len(lift_insts)-hl} outlined"
-                    )
-                selected_instances.extend(lift_insts)
+            # Details → always outline
+            for inst in detail_insts:
+                inst['ann_type'] = 'outline'
 
-            # ---- STAIRCORE / STAIR SHAFT SECTION DRAWINGS ---------------
-            # One large main section shows all floors; detail sections show
-            # individual floor transitions at larger scale.
-            # MAIN_SECTION instances: quota applied bottom-up.
-            # DETAIL instances: outline only — they duplicate main section info.
-            # Staircore PLAN drawings (separate files) use the PLAN branch.
-            staircore_insts = [i for i in instances if i['draw_type'] == 'STAIRCORE']
-            if staircore_insts:
-                main_insts   = [i for i in staircore_insts if i.get('sec_type') != 'DETAIL']
-                detail_insts = [i for i in staircore_insts if i.get('sec_type') == 'DETAIL']
-
-                for inst in detail_insts:
+            # When plan instances exist, elevation instances become outlines
+            # (plan is the primary record for units visible in both views)
+            if plan_insts and elev_insts:
+                for inst in elev_insts:
                     inst['ann_type'] = 'outline'
 
-                # Main section: sort bottom-up (ground floor first)
-                main_insts.sort(key=lambda i: (i['page_idx'], -i['cy']))
-                hl = 0
-                for inst in main_insts:
-                    if hl < q:
-                        inst['ann_type'] = 'highlight'
-                        hl += 1
-                    else:
-                        inst['ann_type'] = 'outline'
-
-                logs.append(
-                    f"  -> '{ref}': staircore section "
-                    f"[main: {hl} highlighted bottom-up, "
-                    f"{len(main_insts)-hl} outlined | "
-                    f"detail zones: {len(detail_insts)} outline-only]"
-                )
-                selected_instances.extend(main_insts)
-                selected_instances.extend(detail_insts)
-
-            # ---- DOCK DRAWINGS ------------------------------------------
-            # Each dock sheet has elevation (top) and plan (bottom) stacked.
-            #
-            # Rule:
-            #   - Ref found in plan AND elevation  -> highlight in plan,
-            #                                         outline in elevation
-            #   - Ref found ONLY in elevation      -> highlight in elevation
-            #     (e.g. sandwich panels, mullions, headers — no plan symbol)
-            #   - Ref found ONLY in plan           -> highlight in plan
-            if dock_insts:
-                dock_plan_raw = [i for i in dock_insts if i.get('sec_type') != 'ELEVATION']
-                dock_elev_raw = [i for i in dock_insts if i.get('sec_type') == 'ELEVATION']
-
-                has_plan_instances = len(dock_plan_raw) > 0
-
-                if has_plan_instances:
-                    # Ref has plan symbols — elevation instances become outlines
-                    for inst in dock_elev_raw:
-                        inst['ann_type'] = 'outline'
-
-                    # Apply boundary strip and quota to plan instances
-                    dock_plan_raw = apply_boundary_strip(dock_plan_raw, sheet_pairs, logs, dock_mode=True)
-
-                    def dock_plan_key(i):
-                        centroid = file_heat_centroids.get(i['filename'])
-                        return pdist((i['cx'], i['cy']), centroid) if centroid else 0
-
-                    dock_plan_raw.sort(key=dock_plan_key)
-
-                    # Quota applies only to non-boundary instances
-                    hl = 0
-                    boundary_hl = sum(1 for i in dock_plan_raw if i.get('is_boundary'))
-                    for inst in dock_plan_raw:
-                        if inst.get('is_boundary') or inst['ann_type'] == 'outline':
-                            continue  # boundary = quota-exempt; outline = already set
-                        if hl < q:
-                            inst['ann_type'] = 'highlight'
-                            hl += 1
-                        else:
-                            inst['ann_type'] = 'outline'
-
-                    logs.append(
-                        f"  -> '{ref}': plan-priority dock "
-                        f"[plan: {hl} highlighted + {boundary_hl} boundary (quota-exempt), "
-                        f"{len(dock_plan_raw)-hl-boundary_hl} outlined | "
-                        f"elev: {len(dock_elev_raw)} outline-only]"
-                    )
-                    selected_instances.extend(dock_plan_raw)
-                    selected_instances.extend(dock_elev_raw)
-
+            # ── ELEVATION / SECTION (only when NO plan instances) ─────────
+            if elev_insts and not plan_insts:
+                elev_insts = apply_boundary_strip(
+                    elev_insts, sheet_pairs, logs, dock_mode=True)
+                horizontal = views_are_horizontal(elev_insts)
+                if horizontal:
+                    elev_insts = sort_by_columns_right_to_left(elev_insts)
+                    hl = run_quota(elev_insts, q, lambda i: 0)
                 else:
-                    # Ref appears ONLY in elevation (e.g. mullion, header panel)
-                    # Treat elevation as primary — apply quota bottom-up
-                    dock_elev_raw.sort(key=lambda i: (i['page_idx'], -i['cy']))
-                    dock_elev_raw = apply_boundary_strip(dock_elev_raw, sheet_pairs, logs, dock_mode=True)
-                    hl = 0
-                    boundary_hl = sum(1 for i in dock_elev_raw if i.get('is_boundary'))
-                    for inst in dock_elev_raw:
-                        if inst.get('is_boundary') or inst['ann_type'] == 'outline':
-                            continue
-                        if hl < q:
-                            inst['ann_type'] = 'highlight'
-                            hl += 1
-                        else:
-                            inst['ann_type'] = 'outline'
-                    logs.append(
-                        f"  -> '{ref}': elevation-only dock "
-                        f"[{hl} highlighted + {boundary_hl} boundary (quota-exempt), "
-                        f"{len(dock_elev_raw)-hl-boundary_hl} outlined]"
-                    )
-                    selected_instances.extend(dock_elev_raw)
+                    hl = run_quota(
+                        elev_insts, q,
+                        lambda i: (i['page_idx'], -i['cy']))
+                b_hl = sum(1 for i in elev_insts if i.get('is_boundary'))
+                logs.append(
+                    f"  '{ref}': elev [{hl} highlighted "
+                    f"{'col-R-to-L' if horizontal else 'bottom-up'}, "
+                    f"{b_hl} stitch-exempt, "
+                    f"{len(elev_insts)-hl-b_hl} outlined]"
+                )
 
-            # ---- ELEVATION / SECTION ----------------------------------------
-            if elev_insts:
-                elev_insts.sort(key=lambda i: (i['page_idx'], -i['cy']))
-                for k, inst in enumerate(elev_insts):
-                    if k < q:
-                        inst['ann_type'] = 'highlight'
-                    else:
-                        inst['ann_type'] = 'outline'
-                if len(elev_insts) > q:
-                    logs.append(
-                        f"  ↳ '{ref}': {len(elev_insts)} elev/sect instances, "
-                        f"marking {q} bottom-up + {len(elev_insts)-q} outlined"
-                    )
-                elif len(elev_insts) < q:
-                    logs.append(
-                        f"  ⚠ '{ref}': elev/sect quota {q}, "
-                        f"only {len(elev_insts)} instance(s) found"
-                    )
-                selected_instances.extend(elev_insts)
-
-            # ---- PLAN / UNKNOWN ---------------------------------------------
+            # ── PLAN ──────────────────────────────────────────────────────
             if plan_insts:
-                # Apply boundary strip — sheet 2 instances near split gridline → outline
-                plan_insts = apply_boundary_strip(plan_insts, sheet_pairs, logs)
+                plan_insts = apply_boundary_strip(
+                    plan_insts, sheet_pairs, logs, dock_mode=True)
 
-                # Sort: floor level ascending, then heat centroid distance within floor
-                def plan_key(i):
-                    centroid = file_heat_centroids.get(i['filename'])
-                    dist = pdist((i['cx'], i['cy']), centroid) if centroid else 0
-                    return (i['floor_lvl'], dist)
+                def plan_sort(i):
+                    c = file_heat_centroids.get(i['filename'])
+                    return (i['floor_lvl'],
+                            pdist((i['cx'], i['cy']), c) if c else 0)
 
-                plan_insts.sort(key=plan_key)
+                hl   = run_quota(plan_insts, q, plan_sort)
+                b_hl = sum(1 for i in plan_insts if i.get('is_boundary'))
+                ev_o = len(elev_insts) if elev_insts else 0
+                logs.append(
+                    f"  '{ref}': plan [{hl} highlighted, "
+                    f"{b_hl} stitch-exempt, "
+                    f"{len(plan_insts)-hl-b_hl} outlined"
+                    + (f" | {ev_o} elev → outline]" if ev_o else "]")
+                )
 
-                # Apply quota — respect boundary-strip outlines already assigned.
-                # Only instances still marked 'highlight' compete for the quota.
-                highlight_count = 0
-                for inst in plan_insts:
-                    if inst['ann_type'] == 'outline':
-                        continue  # boundary strip or prior assignment — leave as outline
-                    if highlight_count < q:
-                        inst['ann_type'] = 'highlight'
-                        highlight_count += 1
-                    else:
-                        inst['ann_type'] = 'outline'
-
-                outline_count = len(plan_insts) - highlight_count
-                if outline_count > 0 or highlight_count < q:
-                    logs.append(
-                        f"  ↳ '{ref}': {len(plan_insts)} plan instances "
-                        f"→ {highlight_count} highlighted, {outline_count} outlined"
-                        + (f" (quota {q} not fully met)" if highlight_count < q else "")
-                    )
-                selected_instances.extend(plan_insts)
-
-            # Assign load numbers for delivered refs
+            # Assign load numbers (delivered refs only)
             if ref in delivered_refs:
                 loads = delivered_map[ref]
-                # Assign to highlights only, in order: elev first then plan
-                highlights = [i for i in selected_instances
+                highlights = [i for i in selected_instances + plan_insts + elev_insts
                               if i['ref'] == ref and i['ann_type'] == 'highlight']
                 for k, inst in enumerate(highlights):
                     inst['load_no'] = loads[k] if k < len(loads) and loads[k] else None
 
-        # ===================================================================
+            selected_instances.extend(plan_insts)
+            selected_instances.extend(elev_insts)
+            selected_instances.extend(detail_insts)
+
+                # ===================================================================
         # PHASE 3: ANNOTATE — open each file and apply highlights + outlines
         # ===================================================================
         by_file = defaultdict(list)
