@@ -14,14 +14,14 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
-APP_VERSION = '1.6.0'
-APP_BUILD   = '2025-06-04'
+APP_VERSION = '1.7.0'
+APP_BUILD   = '2025-06-05'
 APP_NOTES   = (
     'Multi-priority PDF annotation & audit | '
-    'Building (multi-storey), Dock, Lift/Stair/Shaft project types | '
-    'Split-sheet deduplication | '
-    'Elevation-only unit fallback | '
-    'Quota-exempt boundary zones'
+    'Universal view-type detection (font-size titles + CAD viewport frames) | '
+    'Project-type-agnostic quota rules: plan quota / elev quota / detail=outline | '
+    'Auto column-sort for side-by-side elevation views | '
+    'Stitch-line detection: quota-exempt boundary marks on both drawings'
 )
 # ---------------------------------------------------------------------------
 
