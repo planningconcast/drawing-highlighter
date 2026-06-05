@@ -1014,7 +1014,7 @@ def process():
                 file_draw_type = detect_drawing_type(filename, pages)
                 file_draw_types[filename] = file_draw_type
                 floor_lvl = extract_floor_level(filename)
-                logs.append(f"Scanning: {filename} [{file_draw_type}, floor {floor_lvl}]")
+                logs.append(f"Scanning: {filename}")
 
                 for page_idx, page in enumerate(pages):
                     pw, ph = page.rect.width, page.rect.height
@@ -1025,55 +1025,50 @@ def process():
                     # Run on every drawing regardless of project type.
                     # Font-size-ranked titles + CAD viewport frames give us
                     # the view-type of each area of the page.
-                    view_titles = find_view_titles(page)
-                    frames      = detect_viewport_frames(page)
+                    # Detect view layout for this specific page
+                    _titles   = find_view_titles(page)
+                    _frames   = detect_viewport_frames(page)
 
-                    # Build vertical section bands from title positions.
-                    # Each title sits at the bottom of its view section.
-                    page_sections = None
-                    if view_titles:
-                        secs    = []
-                        y_start = 0.0
-                        for t in view_titles:
-                            secs.append({
-                                'type':  t['type'],
-                                'y_min': y_start,
-                                'y_max': t['cy'],
-                            })
-                            y_start = t['cy']
-                        page_sections = secs
+                    # Build section bands: each title sits at bottom of its view
+                    _sections = []
+                    if _titles:
+                        y0 = 0.0
+                        for t in _titles:
+                            _sections.append({'type': t['type'],
+                                              'y_min': y0, 'y_max': t['cy']})
+                            y0 = t['cy']
 
-                    def instance_view_type(cx, cy):
+                    def _view_type(cx, cy,
+                                   _s=_sections, _f=_frames, _t=_titles,
+                                   _dt=file_draw_type):
                         """
-                        Determine the view type (PLAN/ELEVATION/SECTION/DETAIL)
-                        for an instance at (cx, cy).  Priority:
-                          1. Vertical section band from font-size title positions
-                          2. Viewport frame containment + nearest title (side-by-side views)
-                          3. File-level draw_type fallback
+                        Resolve view type for an instance.
+                        Explicit default args bind current values, avoiding
+                        late-binding closure issues with loop variables.
                         """
-                        if page_sections:
-                            vt = section_type_at(cy, page_sections)
+                        # 1. Section bands (vertically stacked views)
+                        if _s:
+                            vt = section_type_at(cy, _s)
                             if vt in ('PLAN', 'ELEVATION', 'SECTION', 'DETAIL'):
                                 return vt
+
+                        # 2. Viewport frame containment (side-by-side views)
                         pt = fitz.Point(cx, cy)
-                        for frame in frames:
-                            if frame.contains(pt) and view_titles:
-                                nearest = min(
-                                    view_titles,
-                                    key=lambda t: abs(t['cy'] - frame.y1)
-                                )
+                        for frame in _f:
+                            if frame.contains(pt) and _t:
+                                nearest = min(_t, key=lambda t: abs(t['cy'] - frame.y1))
                                 return nearest['type']
-                        if file_draw_type in ('ELEVATION', 'SECTION'):
+
+                        # 3. File-level hint as final fallback
+                        if _dt in ('ELEVATION', 'SECTION'):
                             return 'ELEVATION'
-                        if file_draw_type == 'PLAN':
-                            return 'PLAN'
                         return 'PLAN'
 
                     for ref in all_searched:
                         for inst in page.search_for(ref):
                             cx = (inst.x0 + inst.x1) / 2
                             cy = (inst.y0 + inst.y1) / 2
-                            vtype = instance_view_type(cx, cy)
+                            vtype = _view_type(cx, cy)
                             all_candidates[ref].append({
                                 'ref':       ref,
                                 'filename':  filename,
@@ -1089,13 +1084,26 @@ def process():
                                 'load_no':   None,
                                 'ann_type':  'highlight',
                             })
-                            if vtype in ('PLAN', None) or (
-                                    vtype is None and file_draw_type == 'PLAN'):
+                            if vtype in ('PLAN', 'UNKNOWN'):
                                 all_unit_pos_by_file[filename].append((cx, cy))
 
                 file_docs[filename] = doc
             except Exception as e:
                 logs.append(f"ERROR scanning {filename}: {e}")
+
+        # Scan summary — helps diagnose missing refs
+        scan_total = sum(len(v) for v in all_candidates.values())
+        scan_refs  = sum(1 for v in all_candidates.values() if v)
+        logs.append(
+            f"  Scan complete: {scan_total} instance(s) found "
+            f"for {scan_refs}/{len(all_searched)} refs"
+        )
+        if scan_total == 0:
+            logs.append(
+                "  HINT: No text matches found. Check that reference codes "
+                "in the input exactly match the text in the drawings "
+                "(case-sensitive, no extra spaces)."
+            )
 
         # Heat centroids — any file with plan-zone instances
         for filename, in_path in saved_paths:
