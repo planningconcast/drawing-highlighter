@@ -1064,28 +1064,41 @@ def process():
                             return 'ELEVATION'
                         return 'PLAN'
 
+                    # Some PDFs format refs with a space after the hyphen
+                    # e.g. "NLB- 2106" instead of "NLB-2106". Build both
+                    # variants so neither format is missed.
+                    def _variants(r):
+                        spaced = re.sub(r'-(\d)', r'- \1', r)
+                        return [r, spaced] if spaced != r else [r]
+
                     for ref in all_searched:
-                        for inst in page.search_for(ref):
-                            cx = (inst.x0 + inst.x1) / 2
-                            cy = (inst.y0 + inst.y1) / 2
-                            vtype = _view_type(cx, cy)
-                            all_candidates[ref].append({
-                                'ref':       ref,
-                                'filename':  filename,
-                                'in_path':   in_path,
-                                'page_idx':  page_idx,
-                                'rect':      inst,
-                                'elevation': elevation_for_rect(inst, elevations),
-                                'cx': cx, 'cy': cy,
-                                'page_w': pw, 'page_h': ph,
-                                'draw_type': file_draw_type,
-                                'floor_lvl': floor_lvl,
-                                'sec_type':  vtype,
-                                'load_no':   None,
-                                'ann_type':  'highlight',
-                            })
-                            if vtype in ('PLAN', 'UNKNOWN'):
-                                all_unit_pos_by_file[filename].append((cx, cy))
+                        seen_rects = set()   # dedup if both formats on same page
+                        for search_text in _variants(ref):
+                            for inst in page.search_for(search_text):
+                                key = (round(inst.x0), round(inst.y0))
+                                if key in seen_rects:
+                                    continue
+                                seen_rects.add(key)
+                                cx = (inst.x0 + inst.x1) / 2
+                                cy = (inst.y0 + inst.y1) / 2
+                                vtype = _view_type(cx, cy)
+                                all_candidates[ref].append({
+                                    'ref':       ref,
+                                    'filename':  filename,
+                                    'in_path':   in_path,
+                                    'page_idx':  page_idx,
+                                    'rect':      inst,
+                                    'elevation': elevation_for_rect(inst, elevations),
+                                    'cx': cx, 'cy': cy,
+                                    'page_w': pw, 'page_h': ph,
+                                    'draw_type': file_draw_type,
+                                    'floor_lvl': floor_lvl,
+                                    'sec_type':  vtype,
+                                    'load_no':   None,
+                                    'ann_type':  'highlight',
+                                })
+                                if vtype in ('PLAN', 'UNKNOWN'):
+                                    all_unit_pos_by_file[filename].append((cx, cy))
 
                 file_docs[filename] = doc
             except Exception as e:
