@@ -14,8 +14,8 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
-APP_VERSION = '1.7.0'
-APP_BUILD   = '2025-06-05'
+APP_VERSION = '1.7.2'
+APP_BUILD   = '2025-06-08'
 APP_NOTES   = (
     'Multi-priority PDF annotation & audit | '
     'Universal view-type detection (font-size titles + CAD viewport frames) | '
@@ -294,7 +294,14 @@ ELEV_TITLE_RE = re.compile(
     r'|yard\s+walls?\s+elevation)',
     re.IGNORECASE
 )
-DOCK_BAY_RE = re.compile(r'GL\s+([A-Z]+)/(\d+)-(\d+)', re.IGNORECASE)
+# Bay range patterns — handles various title formats:
+# 'GL C/4-8', 'GL C/4-8 to C/8-11'
+# 'Grid W 8-14', 'Grid W/8-14'
+# 'Dock Elevation Grid W 8-14'
+DOCK_BAY_RE = re.compile(
+    r'(?:GL|GRID)\s+([A-Z]+)[/\s](\d+)[-\s]+(\d+)',
+    re.IGNORECASE
+)
 
 
 def get_dock_view_sections(page):
@@ -932,6 +939,25 @@ def process():
     issued_refs    = set(issued_counts.keys()) - set(produced_counts.keys()) - delivered_refs
     all_searched   = delivered_refs | produced_refs | issued_refs
 
+    # Tier consistency checks (Delivered ⊆ Produced ⊆ Issued)
+    _tier_warns = []
+    delivered_not_in_produced = set(delivered_map.keys()) - set(produced_counts.keys())
+    if delivered_not_in_produced:
+        _tier_warns.append(
+            f"  ⚠ Tier inconsistency: {len(delivered_not_in_produced)} Delivered ref(s) "
+            f"not in Produced list: "
+            f"{', '.join(sorted(delivered_not_in_produced)[:5])}"
+            + (f' (+{len(delivered_not_in_produced)-5} more)' if len(delivered_not_in_produced) > 5 else '')
+        )
+    produced_not_in_issued = set(produced_counts.keys()) - set(issued_counts.keys())
+    if produced_not_in_issued:
+        _tier_warns.append(
+            f"  ⚠ Tier inconsistency: {len(produced_not_in_issued)} Produced ref(s) "
+            f"not in Issued list: "
+            f"{', '.join(sorted(produced_not_in_issued)[:5])}"
+            + (f' (+{len(produced_not_in_issued)-5} more)' if len(produced_not_in_issued) > 5 else '')
+        )
+
     def quota(ref):
         if ref in delivered_refs:  return delivered_counts[ref]
         if ref in produced_refs:   return produced_counts[ref]
@@ -975,6 +1001,7 @@ def process():
         f"{len(issued_refs)} issued-only refs — "
         f"{sum(quota(r) for r in all_searched)} total units to mark"
     ]
+    logs.extend(_tier_warns)
 
     found_units:            set  = set()
     unsearched_units_found: set  = set()
@@ -985,11 +1012,12 @@ def process():
         # ===================================================================
         # SCAN PASS — collect all instances, page dims, draw types
         # ===================================================================
-        all_candidates   = defaultdict(list)   # ref → [instance_dict]
-        file_draw_types  = {}
-        file_heat_centroids = {}
-        file_page_dims   = {}                  # filename → (width, height)
+        all_candidates       = defaultdict(list)   # ref → [instance_dict]
+        file_draw_types      = {}
+        file_heat_centroids  = {}
+        file_page_dims       = {}              # filename → (width, height)
         all_unit_pos_by_file = defaultdict(list)
+        file_vp_frames       = defaultdict(list)  # filename → [fitz.Rect]
 
         saved_paths = []
         for upload in files:
@@ -1028,6 +1056,10 @@ def process():
                     # Detect view layout for this specific page
                     _titles   = find_view_titles(page)
                     _frames   = detect_viewport_frames(page)
+                    # Accumulate viewport frames for elevation grouping
+                    file_vp_frames[filename].extend(
+                        f for f in _frames if f not in file_vp_frames[filename]
+                    )
 
                     # Build section bands: each title sits at bottom of its view
                     _sections = []
@@ -1064,12 +1096,19 @@ def process():
                             return 'ELEVATION'
                         return 'PLAN'
 
-                    # Some PDFs format refs with a space after the hyphen
-                    # e.g. "NLB- 2106" instead of "NLB-2106". Build both
-                    # variants so neither format is missed.
+                    # Build search variants to handle common PDF hyphen
+                    # formatting differences.
                     def _variants(r):
-                        spaced = re.sub(r'-(\d)', r'- \1', r)
-                        return [r, spaced] if spaced != r else [r]
+                        v = {r}
+                        # Space after hyphen: 'NLB- 2106'
+                        v.add(re.sub(r'-(\d)', r'- \1', r))
+                        # En-dash: 'NLB–2106' and 'NLB– 2106'
+                        ed = r.replace('-', '–')
+                        v.add(ed)
+                        v.add(re.sub(r'–(\d)', '– \\1', ed))
+                        # Non-breaking hyphen: 'NLB‑2106'
+                        v.add(r.replace('-', '‑'))
+                        return list(v)
 
                     for ref in all_searched:
                         seen_rects = set()   # dedup if both formats on same page
@@ -1214,6 +1253,99 @@ def process():
                     inst['ann_type'] = 'outline'
             return hl
 
+
+            # Check if we actually have multiple floor levels
+            floors = {i['floor_lvl'] for i in plan_insts}
+            if len(floors) < 2:
+                return plan_insts   # single floor — nothing to dedup
+
+            TOL = 200   # PDF units
+
+            # Sort lowest floor first
+            by_floor = sorted(plan_insts, key=lambda i: i['floor_lvl'])
+            claimed  = []   # [(cx, floor_lvl)] of already-primary instances
+
+            for inst in by_floor:
+                if inst['ann_type'] == 'outline':
+                    continue   # already excluded (e.g. boundary strip)
+                cx = inst['cx']
+                fl = inst['floor_lvl']
+                # Check if a lower-floor instance already claimed this x-position
+                is_upper_dup = any(
+                    cfl < fl and abs(cx - ccx) < TOL
+                    for ccx, cfl in claimed
+                )
+                if is_upper_dup:
+                    inst['ann_type'] = 'outline'
+                else:
+                    claimed.append((cx, fl))
+
+            return plan_insts
+
+        def sort_elevations_by_viewports(elev_insts, file_vp_frames):
+            """
+            Group elevation instances by viewport frame.
+            Process frames right-to-left (exhausting each before moving left),
+            bottom-to-top within each frame.
+
+            Falls back to sort_by_columns_right_to_left if no viewport frames
+            are available for the files involved.
+            """
+            if not file_vp_frames or not elev_insts:
+                return sort_by_columns_right_to_left(elev_insts)
+
+            # Build per-instance frame assignment
+            frame_groups = defaultdict(list)  # frame_key -> [inst]
+            unframed     = []
+
+            for inst in elev_insts:
+                fn     = inst['filename']
+                frames = file_vp_frames.get(fn, [])
+                pt     = fitz.Point(inst['cx'], inst['cy'])
+                placed = False
+                for frame in frames:
+                    if frame.contains(pt):
+                        # Key: file + frame top-left rounded to 10 units
+                        fk = (fn, round(frame.x0 / 10), round(frame.y0 / 10))
+                        frame_groups[fk].append((frame, inst))
+                        placed = True
+                        break
+                if not placed:
+                    unframed.append(inst)
+
+            if not frame_groups:
+                # No viewport frame data — use column sort
+                return sort_by_columns_right_to_left(elev_insts)
+
+            # Sort frames: rightmost (largest x0) first, then top-to-bottom
+            def frame_order(fk):
+                _, _, item = next(iter(frame_groups[fk]))
+                frame = next(iter(frame_groups[fk]))[0]
+                return (-frame.x0, frame.y0)
+
+            try:
+                sorted_keys = sorted(
+                    frame_groups.keys(),
+                    key=lambda fk: (
+                        -frame_groups[fk][0][0].x0,
+                         frame_groups[fk][0][0].y0
+                    )
+                )
+            except Exception:
+                return sort_by_columns_right_to_left(elev_insts)
+
+            result = []
+            for fk in sorted_keys:
+                group_insts = [item[1] for item in frame_groups[fk]]
+                # Within each viewport: bottom-up
+                group_insts.sort(key=lambda i: (i['page_idx'], -i['cy']))
+                result.extend(group_insts)
+
+            # Unframed instances appended at end, bottom-up
+            unframed.sort(key=lambda i: (i['page_idx'], -i['cy']))
+            result.extend(unframed)
+            return result
+
         for ref, instances in all_candidates.items():
             q = quota(ref)
             if not instances:
@@ -1228,34 +1360,54 @@ def process():
             for inst in detail_insts:
                 inst['ann_type'] = 'outline'
 
+            # Stair flights and landings are best represented in section
+            # views — their geometry is only clearly visible there.
+            # For these refs, section is primary even when plan instances
+            # also exist. All other refs: plan is primary.
+            STAIR_PREFIX_RE = re.compile(
+                r'^(?:[A-Z]{2,4})(SF|SL|LS|LF|SF|STAIR|FLIGHT|LANDING)',
+                re.IGNORECASE
+            )
+            section_primary = bool(STAIR_PREFIX_RE.search(ref))
+
             # When plan instances exist, elevation instances become outlines
-            # (plan is the primary record for units visible in both views)
-            if plan_insts and elev_insts:
+            # (plan is the primary record for most units).
+            # Exception: stair/landing refs where section is primary.
+            if plan_insts and elev_insts and not section_primary:
                 for inst in elev_insts:
                     inst['ann_type'] = 'outline'
+            elif plan_insts and elev_insts and section_primary:
+                # Section primary — plan instances become outlines
+                for inst in plan_insts:
+                    inst['ann_type'] = 'outline'
 
-            # ── ELEVATION / SECTION (only when NO plan instances) ─────────
-            if elev_insts and not plan_insts:
+            # ── ELEVATION / SECTION (only when NO plan instances,
+            #    or when section is primary for stair/landing refs) ────────
+            if elev_insts and (not plan_insts or section_primary):
                 elev_insts = apply_boundary_strip(
                     elev_insts, sheet_pairs, logs, dock_mode=True)
-                horizontal = views_are_horizontal(elev_insts)
-                if horizontal:
-                    elev_insts = sort_by_columns_right_to_left(elev_insts)
-                    hl = run_quota(elev_insts, q, lambda i: 0)
-                else:
-                    hl = run_quota(
-                        elev_insts, q,
-                        lambda i: (i['page_idx'], -i['cy']))
+
+                # Sort strategy — right-to-left across viewport frames.
+                # Exhausts the rightmost elevation fully before moving left.
+                # Degrades gracefully: single view → bottom-up;
+                # no frame data → column-gap detection.
+                elev_insts = sort_elevations_by_viewports(
+                    elev_insts, file_vp_frames)
+                hl   = run_quota(elev_insts, q, lambda i: 0)
                 b_hl = sum(1 for i in elev_insts if i.get('is_boundary'))
+                # Describe sort method used
+                n_frames = len({(i['filename'], round(i['cx']/10))
+                                for i in elev_insts})
+                sort_desc = f'{n_frames} viewport(s) R-to-L' if n_frames > 1 \
+                            else 'bottom-up'
                 logs.append(
-                    f"  '{ref}': elev [{hl} highlighted "
-                    f"{'col-R-to-L' if horizontal else 'bottom-up'}, "
+                    f"  '{ref}': elev [{hl} highlighted {sort_desc}, "
                     f"{b_hl} stitch-exempt, "
                     f"{len(elev_insts)-hl-b_hl} outlined]"
                 )
 
             # ── PLAN ──────────────────────────────────────────────────────
-            if plan_insts:
+            if plan_insts and not section_primary:
                 plan_insts = apply_boundary_strip(
                     plan_insts, sheet_pairs, logs, dock_mode=True)
 
