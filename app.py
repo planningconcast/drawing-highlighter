@@ -14,7 +14,7 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
-APP_VERSION = '1.7.2'
+APP_VERSION = '1.7.3'
 APP_BUILD   = '2025-06-08'
 APP_NOTES   = (
     'Multi-priority PDF annotation & audit | '
@@ -406,6 +406,7 @@ def build_dock_sheet_pairs(saved_paths, file_draw_types, file_docs):
                 'gridline_x_b': gx_b,
                 'strip_width':  STRIP_WIDTH,
                 'method':       'dock_gl_{}_bay_{}'.format(gl, ea),
+                'dock_mode':    True,  # dock split: both drawings highlight, quota-exempt
             })
     return pairs
 
@@ -647,6 +648,7 @@ def build_sheet_pairs(saved_paths, file_draw_types, file_docs):
                     "gridline_x_b": gx_b,
                     "strip_width": STRIP_WIDTH,
                     "method":      method,
+                    "dock_mode":   False,  # building split: sheet B outlines
                 })
 
         else:
@@ -678,6 +680,7 @@ def build_sheet_pairs(saved_paths, file_draw_types, file_docs):
                         "gridline_x_b": gx_b,
                         "strip_width": STRIP_WIDTH,
                         "method":      "continuation+vector",
+                        "dock_mode":   False,
                     })
     return pairs
 
@@ -698,11 +701,13 @@ def apply_boundary_strip(plan_insts, sheet_pairs, logs, dock_mode=False):
     if not sheet_pairs:
         return plan_insts
 
-    # Build lookup: filename -> list of (gridline_x, strip_width, is_a_side)
+    # Build lookup: filename -> list of (gridline_x, strip_width, is_a_side, pair_dock_mode)
+    # Per-pair dock_mode overrides the function-level dock_mode argument.
     strips = defaultdict(list)
     for pair in sheet_pairs:
-        strips[pair['fn_a']].append((pair['gridline_x_a'], pair['strip_width'], True))
-        strips[pair['fn_b']].append((pair['gridline_x_b'], pair['strip_width'], False))
+        pair_dm = pair.get('dock_mode', dock_mode)
+        strips[pair['fn_a']].append((pair['gridline_x_a'], pair['strip_width'], True,  pair_dm))
+        strips[pair['fn_b']].append((pair['gridline_x_b'], pair['strip_width'], False, pair_dm))
 
     marked_outline = 0
     marked_boundary = 0
@@ -711,16 +716,16 @@ def apply_boundary_strip(plan_insts, sheet_pairs, logs, dock_mode=False):
         fn = inst['filename']
         if fn not in strips:
             continue
-        for gx, sw, is_a in strips[fn]:
+        for gx, sw, is_a, pair_dm in strips[fn]:
             if abs(inst['cx'] - gx) > sw:
                 continue
-            if dock_mode:
-                # Both sides: highlight freely, flag as boundary to skip quota
+            if pair_dm:
+                # Dock mode: both sheets highlight, boundary is quota-exempt
                 inst['is_boundary'] = True
                 inst['ann_type']    = 'highlight'
                 marked_boundary += 1
             else:
-                # Building mode: only sheet B gets outline
+                # Building mode: sheet A highlights normally, sheet B outlines
                 if not is_a and inst['ann_type'] != 'outline':
                     inst['ann_type'] = 'outline'
                     marked_outline += 1
@@ -1385,7 +1390,7 @@ def process():
             #    or when section is primary for stair/landing refs) ────────
             if elev_insts and (not plan_insts or section_primary):
                 elev_insts = apply_boundary_strip(
-                    elev_insts, sheet_pairs, logs, dock_mode=True)
+                    elev_insts, sheet_pairs, logs)
 
                 # Sort strategy — right-to-left across viewport frames.
                 # Exhausts the rightmost elevation fully before moving left.
@@ -1409,7 +1414,7 @@ def process():
             # ── PLAN ──────────────────────────────────────────────────────
             if plan_insts and not section_primary:
                 plan_insts = apply_boundary_strip(
-                    plan_insts, sheet_pairs, logs, dock_mode=True)
+                    plan_insts, sheet_pairs, logs)
 
                 def plan_sort(i):
                     c = file_heat_centroids.get(i['filename'])
